@@ -181,6 +181,18 @@ function AudioCompare({ result }) {
           <span>增强后音频</span>
           <audio controls src={apiUrl(result.enhanced_audio_url)} />
         </div>
+        {result.separated_tracks?.length > 0 && (
+          <div className="separation-list">
+            <h3>语音分离轨道</h3>
+            {result.separated_tracks.map((track) => (
+              <div className="audio-card separated" key={track.track_id}>
+                <span>{track.label}</span>
+                <small>{track.description}</small>
+                <audio controls src={apiUrl(track.audio_url)} />
+              </div>
+            ))}
+          </div>
+        )}
       </div>
       <div className="asr-compare">
         <h3>转写对比</h3>

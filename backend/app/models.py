@@ -1,4 +1,4 @@
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class PipelineStep(BaseModel):
@@ -15,6 +15,13 @@ class TranscriptSegment(BaseModel):
     text: str
 
 
+class SeparatedTrack(BaseModel):
+    track_id: str
+    label: str
+    audio_url: str
+    description: str
+
+
 class MeetingSummary(BaseModel):
     title: str
     keywords: list[str]
@@ -28,6 +35,7 @@ class ProcessResult(BaseModel):
     case_name: str
     original_audio_url: str
     enhanced_audio_url: str
+    separated_tracks: list[SeparatedTrack] = Field(default_factory=list)
     direct_asr_text: str
     enhanced_asr_text: str
     signal_metrics: dict[str, str]
