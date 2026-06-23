@@ -12,7 +12,7 @@
 安装：
 
 ```powershell
-cd F:\homework\3.2\voice_signal_process\Final\smart-meeting-demo\backend
+cd backend
 pip install deepfilternet
 ```
 
@@ -27,7 +27,7 @@ deep-filter --help
 启动后端：
 
 ```powershell
-cd F:\homework\3.2\voice_signal_process\Final\smart-meeting-demo\backend
+cd backend
 $env:DEEPFILTERNET_BACKEND="cli"
 uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
 ```

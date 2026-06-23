@@ -24,6 +24,14 @@ pip install -r requirements.txt
 uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
 ```
 
+如需启用大语言模型摘要生成，复制并填写后端配置文件：
+
+```powershell
+Copy-Item backend\.env.example backend\.env
+```
+
+然后在 `backend/.env` 中填写 `LLM_API_KEY`、`LLM_BASE_URL`、`LLM_MODEL` 和 `LLM_TIMEOUT_SECONDS`。未配置 `LLM_API_KEY` 或模型调用失败时，系统会自动使用缓存摘要，保证课堂演示稳定。完整教程见 `docs/LLM_SUMMARY_SETUP.md`。
+
 后端健康检查：
 
 ```text
@@ -54,6 +62,11 @@ http://127.0.0.1:5173
 - 输出会议主题、关键词、摘要、关键决策和待办事项。
 - 支持上传 `.wav/.mp3/.m4a/.aac/.flac/.ogg` 音频进入演示流程。
 
+## 文档索引
+
+- 大语言模型摘要生成配置：`docs/LLM_SUMMARY_SETUP.md`
+- DeepFilterNet 语音增强配置：`docs/DEEPFILTERNET_SETUP.md`
+
 ## 后续替换真实模型的位置
 
 - 语音增强：`backend/app/services/enhancement_service.py`
@@ -64,9 +77,21 @@ http://127.0.0.1:5173
 - ASR 转写：`backend/app/services/asr_service.py`
   - 可接入 faster-whisper、本地 Whisper 或云端 ASR。
 - 摘要生成：`backend/app/services/summary_service.py`
-  - 可接入大语言模型 API，生成会议摘要、决策和待办事项。
+  - 当前已接入 OpenAI-Compatible Chat Completions API，可通过 `LLM_API_KEY`、`LLM_BASE_URL`、`LLM_MODEL` 和 `LLM_TIMEOUT_SECONDS` 配置 DeepSeek、OpenAI、通义兼容接口或本地兼容服务。
+  - Prompt 输入包含会议名称、增强后 ASR 文本、带时间戳和说话人标签的转写片段。
+  - 模型输出被约束为结构化 JSON：`title`、`keywords`、`abstract`、`decisions`、`action_items`。
+  - 后端会校验 JSON 字段，缺失列表会自动补默认值；未配置 Key、网络错误、超时或模型输出异常时回退到缓存摘要。
 - 样例缓存：`backend/app/data/demo_results.json`
   - 可替换为真实会议样例的预生成转写和摘要结果。
+
+## 摘要生成模块说明
+
+摘要生成模块负责把 ASR 与说话人分段结果转换为结构化会议纪要，是系统从“语音识别”走向“会议内容理解”的核心部分。课堂展示时可以重点说明：
+
+1. 输入不只是普通文本，而是包含时间戳和说话人标签的会议转写。
+2. Prompt 要求模型输出固定 JSON，方便前端直接展示主题、关键词、摘要、决策和待办事项。
+3. 系统在处理指标中展示摘要来源、模型名称和调用状态，能够区分“LLM API 生成”和“缓存兜底”。
+4. 失败兜底机制保证即使 API Key 未配置或网络异常，Demo 仍可稳定运行。
 
 ## 小组分工建议
 
