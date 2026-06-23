@@ -266,10 +266,30 @@ button:disabled {
   border-color: #cfeedd;
 }
 
+.audio-card.separated {
+  background: #fff8ed;
+  border-color: #f1dcba;
+}
+
 .audio-card span {
   display: block;
   margin-bottom: 8px;
   font-weight: 800;
+}
+
+.audio-card small {
+  display: block;
+  margin-bottom: 10px;
+  color: #61738a;
+  line-height: 1.5;
+}
+
+.separation-list {
+  margin-top: 18px;
+}
+
+.separation-list h3 {
+  margin-bottom: 4px;
 }
 
 audio {

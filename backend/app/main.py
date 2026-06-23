@@ -12,6 +12,7 @@ from .services.asr_service import build_pipeline_steps, fallback_upload_result
 from .services.audio_service import UPLOAD_DIR, audio_url, ensure_audio_dirs, ensure_demo_audios, normalize_upload
 from .services.demo_cache import get_case, get_result, load_demo_cases
 from .services.enhancement_service import enhance_demo_audio, enhance_uploaded_audio
+from .services.separation_service import separate_demo_audio, separate_uploaded_audio
 from .services.summary_service import fallback_summary, generate_summary
 
 
@@ -49,6 +50,7 @@ def process_demo(case_id: str) -> ProcessResult:
         raise HTTPException(status_code=404, detail="Demo case not found") from exc
 
     audio = enhance_demo_audio(case_id)
+    separation = separate_demo_audio(case_id, audio["enhanced_audio_url"])
     summary_result = generate_summary(
         transcript=cached["transcript"],
         case_name=case["name"],
@@ -57,6 +59,8 @@ def process_demo(case_id: str) -> ProcessResult:
     )
     signal_metrics = {
         **cached["signal_metrics"],
+        "分离算法": separation["method"],
+        "分离轨道数": separation["track_count"],
         **summary_result.metrics,
     }
     return ProcessResult(
@@ -64,6 +68,7 @@ def process_demo(case_id: str) -> ProcessResult:
         case_name=case["name"],
         original_audio_url=audio["original_audio_url"],
         enhanced_audio_url=audio["enhanced_audio_url"],
+        separated_tracks=separation["tracks"],
         direct_asr_text=cached["direct_asr_text"],
         enhanced_asr_text=cached["enhanced_asr_text"],
         signal_metrics=signal_metrics,
@@ -71,6 +76,22 @@ def process_demo(case_id: str) -> ProcessResult:
         transcript=cached["transcript"],
         summary=summary_result.summary,
     )
+
+
+@app.post("/api/separate-demo/{case_id}")
+def separate_demo(case_id: str) -> dict:
+    try:
+        get_case(case_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Demo case not found") from exc
+
+    audio = enhance_demo_audio(case_id)
+    separation = separate_demo_audio(case_id, audio["enhanced_audio_url"])
+    return {
+        "case_id": case_id,
+        "enhanced_audio_url": audio["enhanced_audio_url"],
+        "separation": separation,
+    }
 
 
 @app.post("/api/upload", response_model=ProcessResult)
@@ -93,11 +114,14 @@ async def upload_audio(file: UploadFile = File(...)) -> ProcessResult:
             "enhanced_audio_url": audio_url(normalized),
             "method": f"上传增强兜底：{exc}",
         }
+    separation = separate_uploaded_audio(audio["enhanced_audio_url"])
 
     fallback = fallback_upload_result(file.filename or raw_path.name)
     signal_metrics = {
         **fallback["signal_metrics"],
         "增强算法": audio["method"],
+        "分离算法": separation["method"],
+        "分离轨道数": separation["track_count"],
     }
     summary_result = generate_summary(
         transcript=fallback["transcript"],
@@ -114,6 +138,7 @@ async def upload_audio(file: UploadFile = File(...)) -> ProcessResult:
         case_name=file.filename or "上传会议音频",
         original_audio_url=audio["original_audio_url"],
         enhanced_audio_url=audio["enhanced_audio_url"],
+        separated_tracks=separation["tracks"],
         direct_asr_text=fallback["direct_asr_text"],
         enhanced_asr_text=fallback["enhanced_asr_text"],
         signal_metrics=signal_metrics,
@@ -121,3 +146,33 @@ async def upload_audio(file: UploadFile = File(...)) -> ProcessResult:
         transcript=fallback["transcript"],
         summary=summary_result.summary,
     )
+
+
+@app.post("/api/separate-upload")
+async def separate_upload(file: UploadFile = File(...)) -> dict:
+    suffix = Path(file.filename or "meeting.wav").suffix.lower()
+    if suffix not in {".wav", ".mp3", ".m4a", ".aac", ".flac", ".ogg"}:
+        raise HTTPException(status_code=400, detail="Unsupported audio format")
+
+    UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    raw_path = UPLOAD_DIR / f"{uuid.uuid4().hex}{suffix}"
+    with raw_path.open("wb") as f:
+        f.write(await file.read())
+
+    normalized = normalize_upload(raw_path, raw_path.stem)
+    try:
+        audio = enhance_uploaded_audio(normalized)
+    except RuntimeError as exc:
+        audio = {
+            "original_audio_url": audio_url(normalized),
+            "enhanced_audio_url": audio_url(normalized),
+            "method": f"上传增强兜底：{exc}",
+        }
+    separation = separate_uploaded_audio(audio["enhanced_audio_url"])
+    return {
+        "file_name": file.filename or raw_path.name,
+        "original_audio_url": audio["original_audio_url"],
+        "enhanced_audio_url": audio["enhanced_audio_url"],
+        "enhancement_method": audio["method"],
+        "separation": separation,
+    }
