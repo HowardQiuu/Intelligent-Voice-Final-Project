@@ -9,10 +9,10 @@ from fastapi.staticfiles import StaticFiles
 
 from .models import ProcessResult
 from .services.asr_service import build_pipeline_steps, fallback_upload_result
-from .services.audio_service import UPLOAD_DIR, ensure_audio_dirs, ensure_demo_audios, normalize_upload
+from .services.audio_service import UPLOAD_DIR, audio_url, ensure_audio_dirs, ensure_demo_audios, normalize_upload
 from .services.demo_cache import get_case, get_result, load_demo_cases
 from .services.enhancement_service import enhance_demo_audio, enhance_uploaded_audio
-from .services.summary_service import fallback_summary
+from .services.summary_service import fallback_summary, generate_summary
 
 
 app = FastAPI(title="Smart Meeting Speech Demo", version="0.1.0")
@@ -49,6 +49,16 @@ def process_demo(case_id: str) -> ProcessResult:
         raise HTTPException(status_code=404, detail="Demo case not found") from exc
 
     audio = enhance_demo_audio(case_id)
+    summary_result = generate_summary(
+        transcript=cached["transcript"],
+        case_name=case["name"],
+        enhanced_asr_text=cached["enhanced_asr_text"],
+        fallback=cached["summary"],
+    )
+    signal_metrics = {
+        **cached["signal_metrics"],
+        **summary_result.metrics,
+    }
     return ProcessResult(
         case_id=case_id,
         case_name=case["name"],
@@ -56,10 +66,10 @@ def process_demo(case_id: str) -> ProcessResult:
         enhanced_audio_url=audio["enhanced_audio_url"],
         direct_asr_text=cached["direct_asr_text"],
         enhanced_asr_text=cached["enhanced_asr_text"],
-        signal_metrics=cached["signal_metrics"],
+        signal_metrics=signal_metrics,
         steps=build_pipeline_steps(cache_mode=True),
         transcript=cached["transcript"],
-        summary=cached["summary"],
+        summary=summary_result.summary,
     )
 
 
@@ -78,12 +88,26 @@ async def upload_audio(file: UploadFile = File(...)) -> ProcessResult:
     try:
         audio = enhance_uploaded_audio(normalized)
     except RuntimeError as exc:
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
+        audio = {
+            "original_audio_url": audio_url(normalized),
+            "enhanced_audio_url": audio_url(normalized),
+            "method": f"上传增强兜底：{exc}",
+        }
 
     fallback = fallback_upload_result(file.filename or raw_path.name)
     signal_metrics = {
         **fallback["signal_metrics"],
         "增强算法": audio["method"],
+    }
+    summary_result = generate_summary(
+        transcript=fallback["transcript"],
+        case_name=file.filename or "上传会议音频",
+        enhanced_asr_text=fallback["enhanced_asr_text"],
+        fallback=fallback_summary(),
+    )
+    signal_metrics = {
+        **signal_metrics,
+        **summary_result.metrics,
     }
     return ProcessResult(
         case_id="upload",
@@ -95,5 +119,5 @@ async def upload_audio(file: UploadFile = File(...)) -> ProcessResult:
         signal_metrics=signal_metrics,
         steps=build_pipeline_steps(cache_mode=False),
         transcript=fallback["transcript"],
-        summary=fallback_summary(),
+        summary=summary_result.summary,
     )
