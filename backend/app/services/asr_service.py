@@ -6,6 +6,7 @@ def build_pipeline_steps(cache_mode: bool = True) -> list[dict]:
     return [
         {"key": "input", "name": "会议音频输入", "status": "done", "detail": f"已读取{source}"},
         {"key": "enhance", "name": "语音增强", "status": "done", "detail": "完成降噪、归一化与增强音频输出"},
+        {"key": "chunking", "name": "分块处理", "status": "done", "detail": "按固定窗口规划长会议音频，避免一次性占满内存"},
         {"key": "separation", "name": "语音分离", "status": "done", "detail": "输出可替换的说话人/语音轨道结果"},
         {"key": "asr", "name": "自动语音识别", "status": "done", "detail": "基于分离轨道生成带时间戳的会议转写文本"},
         {"key": "summary", "name": "概要生成", "status": "done", "detail": "提取主题、关键词、决策与待办事项"},

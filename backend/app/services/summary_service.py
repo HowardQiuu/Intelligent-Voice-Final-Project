@@ -47,6 +47,17 @@ def generate_summary(
     model = os.getenv("LLM_MODEL", DEFAULT_MODEL).strip() or DEFAULT_MODEL
     api_key = os.getenv("LLM_API_KEY", "").strip()
 
+    if not _env_enabled("LLM_ENABLED", default=True):
+        return SummaryGenerationResult(
+            summary=fallback_data,
+            metrics={
+                "摘要生成": "缓存兜底",
+                "摘要模型": model,
+                "摘要状态": "LLM_ENABLED=false",
+            },
+            used_llm=False,
+        )
+
     if not api_key:
         return SummaryGenerationResult(
             summary=fallback_data,
@@ -226,3 +237,10 @@ def _get_timeout_seconds() -> float:
     except ValueError:
         return DEFAULT_TIMEOUT_SECONDS
     return max(1.0, timeout)
+
+
+def _env_enabled(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() not in {"0", "false", "no", "off"}

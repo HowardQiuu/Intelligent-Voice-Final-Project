@@ -181,6 +181,44 @@ button:disabled {
   font-size: 14px;
 }
 
+.local-file-box {
+  margin-top: 16px;
+  padding-top: 16px;
+  border-top: 1px solid #d9e7f5;
+}
+
+.local-file-box label {
+  display: block;
+  margin-bottom: 8px;
+  color: #1559c7;
+  font-weight: 800;
+}
+
+.local-file-row {
+  display: grid;
+  gap: 8px;
+}
+
+.local-file-row input {
+  min-width: 0;
+  min-height: 38px;
+  padding: 0 10px;
+  color: #172033;
+  background: #ffffff;
+  border: 1px solid #d9e7f5;
+  border-radius: 8px;
+}
+
+.secondary-action {
+  min-height: 38px;
+  color: white;
+  background: #1559c7;
+  border: 0;
+  border-radius: 8px;
+  cursor: pointer;
+  font-weight: 700;
+}
+
 .workspace {
   display: grid;
   gap: 18px;
@@ -216,7 +254,7 @@ button:disabled {
 
 .pipeline {
   display: grid;
-  grid-template-columns: repeat(5, minmax(0, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
   gap: 10px;
   margin-top: 18px;
 }
@@ -290,6 +328,77 @@ button:disabled {
 
 .separation-list h3 {
   margin-bottom: 4px;
+}
+
+.enhancement-visual {
+  grid-column: 1 / -1;
+  margin-top: 4px;
+  padding: 20px;
+  background: #f7fbff;
+  border: 1px solid #dfeaf7;
+  border-radius: 8px;
+}
+
+.enhancement-visual h3,
+.chunk-list h3 {
+  margin-bottom: 10px;
+}
+
+.enhancement-visual img {
+  display: block;
+  width: 100%;
+  height: auto;
+  border: 1px solid #d9e7f5;
+  border-radius: 8px;
+  background: white;
+}
+
+.chunk-list {
+  margin-top: 16px;
+  padding: 14px;
+  background: #f7fbff;
+  border: 1px solid #dfeaf7;
+  border-radius: 8px;
+}
+
+.chunk-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(132px, 1fr));
+  gap: 8px;
+}
+
+.chunk-item {
+  min-height: 78px;
+  padding: 10px;
+  background: white;
+  border: 1px solid #e0e8f1;
+  border-radius: 8px;
+}
+
+.chunk-item strong,
+.chunk-item span,
+.chunk-item small {
+  display: block;
+}
+
+.chunk-item strong {
+  color: #1559c7;
+}
+
+.chunk-item span {
+  margin: 4px 0;
+  color: #172033;
+  font-size: 13px;
+}
+
+.chunk-item small,
+.chunk-more {
+  color: #60758c;
+}
+
+.chunk-more {
+  margin: 10px 0 0;
+  font-size: 13px;
 }
 
 audio {
@@ -397,6 +506,40 @@ audio {
   background: #fff0f0;
   border: 1px solid #ffd3d3;
   border-radius: 8px;
+}
+
+.upload-progress {
+  padding: 14px;
+  background: #f7fbff;
+  border: 1px solid #d9e7f5;
+  border-radius: 8px;
+}
+
+.upload-progress-header {
+  display: flex;
+  justify-content: space-between;
+  gap: 14px;
+  margin-bottom: 10px;
+  color: #1c2d46;
+}
+
+.upload-progress-header span {
+  color: #60758c;
+  font-size: 13px;
+}
+
+.upload-progress-track {
+  height: 10px;
+  overflow: hidden;
+  background: #dceaf8;
+  border-radius: 999px;
+}
+
+.upload-progress-track span {
+  display: block;
+  height: 100%;
+  background: linear-gradient(90deg, #1f62d2, #22a58d);
+  transition: width 0.18s ease;
 }
 
 .spin {

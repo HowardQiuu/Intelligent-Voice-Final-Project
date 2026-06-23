@@ -22,6 +22,15 @@ class SeparatedTrack(BaseModel):
     description: str
 
 
+class ProcessingChunk(BaseModel):
+    chunk_id: str
+    start: str
+    end: str
+    duration_seconds: float
+    status: str
+    description: str
+
+
 class MeetingSummary(BaseModel):
     title: str
     keywords: list[str]
@@ -35,6 +44,8 @@ class ProcessResult(BaseModel):
     case_name: str
     original_audio_url: str
     enhanced_audio_url: str
+    enhancement_visual_url: str | None = None
+    processing_chunks: list[ProcessingChunk] = Field(default_factory=list)
     separated_tracks: list[SeparatedTrack] = Field(default_factory=list)
     direct_asr_text: str
     enhanced_asr_text: str
@@ -42,3 +53,23 @@ class ProcessResult(BaseModel):
     steps: list[PipelineStep]
     transcript: list[TranscriptSegment]
     summary: MeetingSummary
+
+
+class LocalFileRequest(BaseModel):
+    path: str
+
+
+class UploadSessionCreateRequest(BaseModel):
+    filename: str
+    size_bytes: int = Field(ge=1)
+
+
+class UploadSessionResponse(BaseModel):
+    upload_id: str
+    chunk_size_bytes: int
+    total_chunks: int
+
+
+class UploadSessionCompleteRequest(BaseModel):
+    filename: str
+    total_chunks: int = Field(ge=1)

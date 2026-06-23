@@ -85,6 +85,20 @@ class SummaryServiceTest(unittest.TestCase):
         self.assertEqual(result.metrics["摘要生成"], "缓存兜底")
         self.assertEqual(result.metrics["摘要状态"], "未配置 LLM_API_KEY")
 
+    def test_llm_disabled_uses_fallback_even_with_api_key(self) -> None:
+        with patch.dict(os.environ, {"LLM_API_KEY": "test-key", "LLM_ENABLED": "false"}, clear=True):
+            result = generate_summary(
+                transcript=SAMPLE_TRANSCRIPT,
+                case_name="测试会议",
+                enhanced_asr_text="今天讨论摘要模块。",
+                fallback=FALLBACK_SUMMARY,
+            )
+
+        self.assertFalse(result.used_llm)
+        self.assertEqual(result.summary["title"], "缓存摘要")
+        self.assertEqual(result.metrics["摘要生成"], "缓存兜底")
+        self.assertEqual(result.metrics["摘要状态"], "LLM_ENABLED=false")
+
     @patch("app.services.summary_service.httpx.Client", FakeClient)
     def test_llm_json_summary_success(self) -> None:
         with patch.dict(

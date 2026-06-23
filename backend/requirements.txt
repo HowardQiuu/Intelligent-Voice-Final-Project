@@ -3,5 +3,6 @@ uvicorn[standard]==0.32.1
 python-multipart==0.0.19
 httpx==0.28.1
 python-dotenv==1.2.2
+soundfile==0.13.1
 # Optional real denoising model. Install manually when you want DeepFilterNet:
 # python -m pip install deepfilternet

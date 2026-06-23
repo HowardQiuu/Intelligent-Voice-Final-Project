@@ -100,3 +100,51 @@ def audio_url(path: Path) -> str:
     if "uploads" in path.parts:
         return f"/static/uploads/{path.name}"
     return f"/static/audio/{path.name}"
+
+
+def resolve_static_url(url: str) -> Path | None:
+    if url.startswith("/static/audio/"):
+        return STATIC_AUDIO_DIR / Path(url).name
+    if url.startswith("/static/uploads/"):
+        return UPLOAD_DIR / Path(url).name
+    return None
+
+
+def get_audio_duration_seconds(path: Path) -> float | None:
+    """Read duration from metadata without loading the full waveform."""
+    try:
+        with wave.open(str(path), "rb") as wav:
+            frame_rate = wav.getframerate()
+            if frame_rate <= 0:
+                return None
+            return wav.getnframes() / frame_rate
+    except (wave.Error, OSError, EOFError):
+        pass
+
+    try:
+        soundfile = __import__("soundfile")
+        info = soundfile.info(str(path))
+        if info.samplerate > 0 and info.frames > 0:
+            return info.frames / info.samplerate
+    except Exception:
+        pass
+
+    ffprobe = shutil.which("ffprobe")
+    if not ffprobe:
+        return None
+
+    cmd = [
+        ffprobe,
+        "-v",
+        "error",
+        "-show_entries",
+        "format=duration",
+        "-of",
+        "default=noprint_wrappers=1:nokey=1",
+        str(path),
+    ]
+    try:
+        result = subprocess.run(cmd, check=True, capture_output=True, text=True, timeout=10)
+        return float(result.stdout.strip())
+    except (subprocess.SubprocessError, ValueError, OSError):
+        return None

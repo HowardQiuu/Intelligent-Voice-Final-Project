@@ -8,12 +8,13 @@ import sys
 import uuid
 from pathlib import Path
 
-from .audio_service import UPLOAD_DIR, audio_url, generate_demo_audio
+from .audio_service import UPLOAD_DIR, audio_url, generate_demo_audio, get_audio_duration_seconds
 
 BACKEND_DIR = Path(__file__).resolve().parents[2]
 PROJECT_VENDOR_DIR = BACKEND_DIR / "vendor" / "DeepFilterNet"
 DEFAULT_SOURCE_DIR = PROJECT_VENDOR_DIR / "DeepFilterNet"
 DEFAULT_MODEL_DIR = PROJECT_VENDOR_DIR / "models" / "DeepFilterNet3"
+DEFAULT_ENHANCEMENT_MAX_SECONDS = 300.0
 
 
 def _normalize_model_dir(model_dir: Path) -> Path:
@@ -171,9 +172,35 @@ def denoise_audio(path: Path) -> tuple[Path, str]:
 
 
 def enhance_uploaded_audio(path: Path) -> dict[str, str]:
+    duration = get_audio_duration_seconds(path)
+    max_seconds = _get_enhancement_max_seconds()
+    if should_skip_enhancement(path):
+        return {
+            "original_audio_url": audio_url(path),
+            "enhanced_audio_url": audio_url(path),
+            "method": (
+                "Long audio skipped DeepFilterNet "
+                f"({duration / 60:.1f} min > {max_seconds / 60:.1f} min)"
+            ),
+        }
+
     denoised_path, denoise_method = denoise_audio(path)
     return {
         "original_audio_url": audio_url(path),
         "enhanced_audio_url": audio_url(denoised_path),
         "method": denoise_method,
     }
+
+
+def should_skip_enhancement(path: Path) -> bool:
+    duration = get_audio_duration_seconds(path)
+    return duration is not None and duration > _get_enhancement_max_seconds()
+
+
+def _get_enhancement_max_seconds() -> float:
+    raw = os.getenv("ENHANCEMENT_MAX_SECONDS", str(DEFAULT_ENHANCEMENT_MAX_SECONDS)).strip()
+    try:
+        value = float(raw)
+    except ValueError:
+        return DEFAULT_ENHANCEMENT_MAX_SECONDS
+    return max(1.0, value)

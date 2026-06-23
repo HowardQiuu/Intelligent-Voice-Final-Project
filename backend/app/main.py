@@ -7,14 +7,32 @@ from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
-from .models import ProcessResult
-from .services.asr_service import build_pipeline_steps, fallback_upload_result
-from .services.audio_service import UPLOAD_DIR, audio_url, ensure_audio_dirs, ensure_demo_audios, normalize_upload
-from .services.demo_cache import get_case, get_result, load_demo_cases
-from .services.enhancement_service import enhance_demo_audio, enhance_uploaded_audio
-from .services.separation_service import separate_demo_audio, separate_uploaded_audio
-from .services.summary_service import fallback_summary, generate_summary
+from .models import (
+    LocalFileRequest,
+    ProcessResult,
+    UploadSessionCompleteRequest,
+    UploadSessionCreateRequest,
+    UploadSessionResponse,
+)
+from .services.audio_service import UPLOAD_DIR, ensure_audio_dirs, ensure_demo_audios
+from .services.demo_cache import get_case, load_demo_cases
+from .services.enhancement_service import enhance_demo_audio
+from .services.pipeline_service import (
+    process_audio_path,
+    process_demo_case,
+    save_upload_stream,
+    separate_uploaded_path,
+    stage_local_file,
+)
+from .services.separation_service import separate_demo_audio
+from .services.upload_session_service import (
+    complete_upload_session,
+    create_upload_session,
+    save_upload_chunk,
+)
 
+
+ALLOWED_AUDIO_SUFFIXES = {".wav", ".mp3", ".m4a", ".aac", ".flac", ".ogg"}
 
 app = FastAPI(title="Smart Meeting Speech Demo", version="0.1.0")
 
@@ -44,38 +62,9 @@ def demo_cases() -> list[dict]:
 @app.post("/api/process-demo/{case_id}", response_model=ProcessResult)
 def process_demo(case_id: str) -> ProcessResult:
     try:
-        case = get_case(case_id)
-        cached = get_result(case_id)
+        return process_demo_case(case_id)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="Demo case not found") from exc
-
-    audio = enhance_demo_audio(case_id)
-    separation = separate_demo_audio(case_id, audio["enhanced_audio_url"])
-    summary_result = generate_summary(
-        transcript=cached["transcript"],
-        case_name=case["name"],
-        enhanced_asr_text=cached["enhanced_asr_text"],
-        fallback=cached["summary"],
-    )
-    signal_metrics = {
-        **cached["signal_metrics"],
-        "分离算法": separation["method"],
-        "分离轨道数": separation["track_count"],
-        **summary_result.metrics,
-    }
-    return ProcessResult(
-        case_id=case_id,
-        case_name=case["name"],
-        original_audio_url=audio["original_audio_url"],
-        enhanced_audio_url=audio["enhanced_audio_url"],
-        separated_tracks=separation["tracks"],
-        direct_asr_text=cached["direct_asr_text"],
-        enhanced_asr_text=cached["enhanced_asr_text"],
-        signal_metrics=signal_metrics,
-        steps=build_pipeline_steps(cache_mode=True),
-        transcript=cached["transcript"],
-        summary=summary_result.summary,
-    )
 
 
 @app.post("/api/separate-demo/{case_id}")
@@ -96,83 +85,66 @@ def separate_demo(case_id: str) -> dict:
 
 @app.post("/api/upload", response_model=ProcessResult)
 async def upload_audio(file: UploadFile = File(...)) -> ProcessResult:
-    suffix = Path(file.filename or "meeting.wav").suffix.lower()
-    if suffix not in {".wav", ".mp3", ".m4a", ".aac", ".flac", ".ogg"}:
-        raise HTTPException(status_code=400, detail="Unsupported audio format")
-
+    suffix = _validate_audio_suffix(file.filename or "meeting.wav")
     UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
     raw_path = UPLOAD_DIR / f"{uuid.uuid4().hex}{suffix}"
-    with raw_path.open("wb") as f:
-        f.write(await file.read())
+    await save_upload_stream(file, raw_path)
+    return process_audio_path(raw_path, file.filename or raw_path.name, case_id="upload")
 
-    normalized = normalize_upload(raw_path, raw_path.stem)
+
+@app.post("/api/upload-session", response_model=UploadSessionResponse)
+def create_chunked_upload(request: UploadSessionCreateRequest) -> UploadSessionResponse:
+    suffix = _validate_audio_suffix(request.filename)
+    session = create_upload_session(request.filename, request.size_bytes, suffix)
+    return UploadSessionResponse(**session)
+
+
+@app.post("/api/upload-session/{upload_id}/chunk")
+async def upload_chunk(upload_id: str, index: int, file: UploadFile = File(...)) -> dict:
     try:
-        audio = enhance_uploaded_audio(normalized)
-    except RuntimeError as exc:
-        audio = {
-            "original_audio_url": audio_url(normalized),
-            "enhanced_audio_url": audio_url(normalized),
-            "method": f"上传增强兜底：{exc}",
-        }
-    separation = separate_uploaded_audio(audio["enhanced_audio_url"])
+        return await save_upload_chunk(upload_id, index, file)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="Upload session not found") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    fallback = fallback_upload_result(file.filename or raw_path.name)
-    signal_metrics = {
-        **fallback["signal_metrics"],
-        "增强算法": audio["method"],
-        "分离算法": separation["method"],
-        "分离轨道数": separation["track_count"],
-    }
-    summary_result = generate_summary(
-        transcript=fallback["transcript"],
-        case_name=file.filename or "上传会议音频",
-        enhanced_asr_text=fallback["enhanced_asr_text"],
-        fallback=fallback_summary(),
-    )
-    signal_metrics = {
-        **signal_metrics,
-        **summary_result.metrics,
-    }
-    return ProcessResult(
-        case_id="upload",
-        case_name=file.filename or "上传会议音频",
-        original_audio_url=audio["original_audio_url"],
-        enhanced_audio_url=audio["enhanced_audio_url"],
-        separated_tracks=separation["tracks"],
-        direct_asr_text=fallback["direct_asr_text"],
-        enhanced_asr_text=fallback["enhanced_asr_text"],
-        signal_metrics=signal_metrics,
-        steps=build_pipeline_steps(cache_mode=False),
-        transcript=fallback["transcript"],
-        summary=summary_result.summary,
-    )
+
+@app.post("/api/upload-session/{upload_id}/complete", response_model=ProcessResult)
+def complete_chunked_upload(upload_id: str, request: UploadSessionCompleteRequest) -> ProcessResult:
+    try:
+        raw_path, display_name = complete_upload_session(upload_id, request.total_chunks)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="Upload session not found") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return process_audio_path(raw_path, request.filename or display_name, case_id="upload")
+
+
+@app.post("/api/process-local-file", response_model=ProcessResult)
+def process_local_file(request: LocalFileRequest) -> ProcessResult:
+    source_path = Path(request.path).expanduser()
+    _validate_local_audio_file(source_path)
+    staged_path = stage_local_file(source_path)
+    return process_audio_path(staged_path, source_path.name, case_id="local-file")
 
 
 @app.post("/api/separate-upload")
 async def separate_upload(file: UploadFile = File(...)) -> dict:
-    suffix = Path(file.filename or "meeting.wav").suffix.lower()
-    if suffix not in {".wav", ".mp3", ".m4a", ".aac", ".flac", ".ogg"}:
-        raise HTTPException(status_code=400, detail="Unsupported audio format")
-
+    suffix = _validate_audio_suffix(file.filename or "meeting.wav")
     UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
     raw_path = UPLOAD_DIR / f"{uuid.uuid4().hex}{suffix}"
-    with raw_path.open("wb") as f:
-        f.write(await file.read())
+    await save_upload_stream(file, raw_path)
+    return separate_uploaded_path(raw_path, file.filename or raw_path.name)
 
-    normalized = normalize_upload(raw_path, raw_path.stem)
-    try:
-        audio = enhance_uploaded_audio(normalized)
-    except RuntimeError as exc:
-        audio = {
-            "original_audio_url": audio_url(normalized),
-            "enhanced_audio_url": audio_url(normalized),
-            "method": f"上传增强兜底：{exc}",
-        }
-    separation = separate_uploaded_audio(audio["enhanced_audio_url"])
-    return {
-        "file_name": file.filename or raw_path.name,
-        "original_audio_url": audio["original_audio_url"],
-        "enhanced_audio_url": audio["enhanced_audio_url"],
-        "enhancement_method": audio["method"],
-        "separation": separation,
-    }
+
+def _validate_audio_suffix(filename: str) -> str:
+    suffix = Path(filename).suffix.lower()
+    if suffix not in ALLOWED_AUDIO_SUFFIXES:
+        raise HTTPException(status_code=400, detail="Unsupported audio format")
+    return suffix
+
+
+def _validate_local_audio_file(path: Path) -> None:
+    if not path.exists() or not path.is_file():
+        raise HTTPException(status_code=404, detail="Local audio file not found")
+    _validate_audio_suffix(path.name)
