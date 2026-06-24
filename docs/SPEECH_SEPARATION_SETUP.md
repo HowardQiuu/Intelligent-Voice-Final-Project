@@ -62,8 +62,10 @@ Windows note: the backend uses SpeechBrain `LocalStrategy.COPY` to avoid symlink
 ```text
 SEPARATION_BACKEND=speechbrain
 SEPARATION_MODEL=speechbrain/sepformer-wsj02mix
-SEPARATION_DEVICE=cpu
+SEPARATION_DEVICE=auto
 SEPARATION_MAX_SECONDS=60
+SEPARATION_CHUNK_SECONDS=60
+SEPARATION_MAX_CHUNKS=120
 ENHANCEMENT_MAX_SECONDS=300
 ```
 
@@ -148,8 +150,8 @@ Invoke-RestMethod `
 - 推理异常
 - 音频文件不存在或格式不兼容
 - CPU 推理过慢或音频过长
-- 上传音频超过 `SEPARATION_MAX_SECONDS` 时，推理前直接跳过 SepFormer，避免长会议音频占满内存
-- 上传音频超过 `ENHANCEMENT_MAX_SECONDS` 时，跳过 DeepFilterNet 增强，直接保留归一化音频进入后续流程
+- 上传音频超过 `SEPARATION_MAX_SECONDS` 时，按 `SEPARATION_CHUNK_SECONDS` 分块调用 SepFormer，再按说话人轨道拼接输出
+- 上传音频超过 `ENHANCEMENT_MAX_SECONDS` 时，按 `ENHANCEMENT_CHUNK_SECONDS` 分块调用 DeepFilterNet，增强后拼接为一条完整音频，再进入分离/ASR/摘要流程
 
 回退时接口仍会返回 `tracks`，并在指标中显示：
 
@@ -173,7 +175,7 @@ CHUNK_OVERLAP_SECONDS=5
 processing_chunks
 ```
 
-每个分块包含 `chunk_id`、`start`、`end`、`duration_seconds`、`status` 和 `description`。当前版本先用分块计划保护内存，并预留后续逐块增强、逐块分离、逐块 ASR 的接口形状。
+每个分块包含 `chunk_id`、`start`、`end`、`duration_seconds`、`status` 和 `description`。当前版本已经在后端使用分块策略执行长音频增强、长音频分离和长音频 ASR，并在模型不可用或单块失败时兜底。
 
 语音增强会额外生成可视化图片：
 

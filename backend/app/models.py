@@ -15,6 +15,21 @@ class TranscriptSegment(BaseModel):
     text: str
 
 
+class TranscriptTopicBlock(BaseModel):
+    block_id: str
+    start: str
+    end: str
+    summary: str
+    segments: list[TranscriptSegment] = Field(default_factory=list)
+
+
+class TranscriptTopic(BaseModel):
+    topic_id: str
+    title: str
+    summary: str
+    blocks: list[TranscriptTopicBlock] = Field(default_factory=list)
+
+
 class SeparatedTrack(BaseModel):
     track_id: str
     label: str
@@ -52,6 +67,7 @@ class ProcessResult(BaseModel):
     signal_metrics: dict[str, str]
     steps: list[PipelineStep]
     transcript: list[TranscriptSegment]
+    transcript_topics: list[TranscriptTopic] = Field(default_factory=list)
     summary: MeetingSummary
 
 

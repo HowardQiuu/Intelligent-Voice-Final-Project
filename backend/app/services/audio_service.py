@@ -18,7 +18,11 @@ def ensure_audio_dirs() -> None:
 
 
 def has_ffmpeg() -> bool:
-    return shutil.which("ffmpeg") is not None
+    return _ffmpeg_executable() is not None
+
+
+def ffmpeg_executable() -> str | None:
+    return _ffmpeg_executable()
 
 
 def normalize_upload(input_path: Path, output_name: str) -> Path:
@@ -26,9 +30,10 @@ def normalize_upload(input_path: Path, output_name: str) -> Path:
     output_path = UPLOAD_DIR / f"{output_name}.wav"
     if output_path.resolve() == input_path.resolve():
         output_path = UPLOAD_DIR / f"{output_name}_normalized.wav"
-    if has_ffmpeg():
+    ffmpeg = _ffmpeg_executable()
+    if ffmpeg:
         cmd = [
-            "ffmpeg",
+            ffmpeg,
             "-y",
             "-i",
             str(input_path),
@@ -47,6 +52,17 @@ def normalize_upload(input_path: Path, output_name: str) -> Path:
     else:
         shutil.copyfile(input_path, output_path)
     return output_path
+
+
+def _ffmpeg_executable() -> str | None:
+    ffmpeg = shutil.which("ffmpeg")
+    if ffmpeg:
+        return ffmpeg
+    try:
+        imageio_ffmpeg = __import__("imageio_ffmpeg")
+        return imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception:
+        return None
 
 
 def generate_demo_audio(case_id: str, noisy: bool = False) -> Path:

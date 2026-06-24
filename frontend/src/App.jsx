@@ -9,6 +9,7 @@ import {
 import { AudioCompare } from "./components/AudioCompare";
 import { EmptyState } from "./components/EmptyState";
 import { Pipeline } from "./components/Pipeline";
+import { ProcessingDiagnostics } from "./components/ProcessingDiagnostics";
 import { Summary } from "./components/Summary";
 import { Transcript } from "./components/Transcript";
 
@@ -101,9 +102,10 @@ export function App() {
           ) : (
             <>
               <Pipeline steps={result.steps} />
+              <ProcessingDiagnostics metrics={result.signal_metrics} />
               <AudioCompare result={result} />
               <Transcript result={result} />
-              <Summary summary={result.summary} metrics={result.signal_metrics} />
+              <Summary summary={result.summary} />
             </>
           )}
         </section>

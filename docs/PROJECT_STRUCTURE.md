@@ -41,7 +41,7 @@ backend/app/services/
 
 - `pipeline_service.py`：完整处理流水线编排，连接增强、分块、分离、ASR 兜底和摘要。
 - `audio_service.py`：音频目录、上传归一化、音频时长读取、静态 URL 解析。
-- `enhancement_service.py`：语音增强与长音频跳过策略。
+- `enhancement_service.py`：语音增强与长音频分块增强策略。
 - `chunking_service.py`：长会议音频分块计划。
 - `separation_service.py`：SpeechBrain SepFormer 分离与 placeholder 兜底。
 - `asr_service.py`：ASR 流程步骤和上传音频转写兜底。

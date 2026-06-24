@@ -8,13 +8,21 @@ import sys
 import uuid
 from pathlib import Path
 
-from .audio_service import UPLOAD_DIR, audio_url, generate_demo_audio, get_audio_duration_seconds
+from .audio_service import (
+    UPLOAD_DIR,
+    audio_url,
+    ffmpeg_executable,
+    generate_demo_audio,
+    get_audio_duration_seconds,
+)
 
 BACKEND_DIR = Path(__file__).resolve().parents[2]
 PROJECT_VENDOR_DIR = BACKEND_DIR / "vendor" / "DeepFilterNet"
 DEFAULT_SOURCE_DIR = PROJECT_VENDOR_DIR / "DeepFilterNet"
 DEFAULT_MODEL_DIR = PROJECT_VENDOR_DIR / "models" / "DeepFilterNet3"
 DEFAULT_ENHANCEMENT_MAX_SECONDS = 300.0
+DEFAULT_ENHANCEMENT_CHUNK_SECONDS = 60.0
+DEFAULT_ENHANCEMENT_MAX_CHUNKS = 120
 
 
 def _normalize_model_dir(model_dir: Path) -> Path:
@@ -171,20 +179,40 @@ def denoise_audio(path: Path) -> tuple[Path, str]:
     raise RuntimeError("Unsupported DEEPFILTERNET_BACKEND. Use 'source' or 'cli'.")
 
 
+def denoise_audio_in_chunks(path: Path, duration: float) -> tuple[Path, str]:
+    """Denoise long audio chunk-by-chunk to keep memory bounded."""
+    chunk_seconds = _get_enhancement_chunk_seconds()
+    chunk_count = int((duration + chunk_seconds - 0.001) // chunk_seconds)
+    max_chunks = _get_enhancement_max_chunks()
+    if chunk_count > max_chunks:
+        raise RuntimeError(f"Audio requires {chunk_count} enhancement chunks, over limit {max_chunks}")
+
+    work_dir = UPLOAD_DIR / f"enhancement_chunks_{uuid.uuid4().hex[:10]}"
+    work_dir.mkdir(parents=True, exist_ok=True)
+
+    chunk_paths = _split_audio_to_chunks(path, work_dir, chunk_seconds, duration)
+    enhanced_chunks: list[Path] = []
+    try:
+        for chunk_path in chunk_paths:
+            enhanced_path, _ = denoise_audio(chunk_path)
+            enhanced_chunks.append(enhanced_path)
+
+        output_path = UPLOAD_DIR / f"{path.stem}_deepfilter_chunked.wav"
+        _concat_audio_chunks(enhanced_chunks, output_path)
+        return output_path, f"DeepFilterNet chunked denoise ({len(enhanced_chunks)} chunks x {chunk_seconds:g}s)"
+    finally:
+        shutil.rmtree(work_dir, ignore_errors=True)
+        for enhanced_path in enhanced_chunks:
+            if enhanced_path.parent == UPLOAD_DIR and enhanced_path.exists():
+                enhanced_path.unlink(missing_ok=True)
+
+
 def enhance_uploaded_audio(path: Path) -> dict[str, str]:
     duration = get_audio_duration_seconds(path)
-    max_seconds = _get_enhancement_max_seconds()
-    if should_skip_enhancement(path):
-        return {
-            "original_audio_url": audio_url(path),
-            "enhanced_audio_url": audio_url(path),
-            "method": (
-                "Long audio skipped DeepFilterNet "
-                f"({duration / 60:.1f} min > {max_seconds / 60:.1f} min)"
-            ),
-        }
-
-    denoised_path, denoise_method = denoise_audio(path)
+    if duration is not None and duration > _get_enhancement_max_seconds():
+        denoised_path, denoise_method = denoise_audio_in_chunks(path, duration)
+    else:
+        denoised_path, denoise_method = denoise_audio(path)
     return {
         "original_audio_url": audio_url(path),
         "enhanced_audio_url": audio_url(denoised_path),
@@ -193,8 +221,95 @@ def enhance_uploaded_audio(path: Path) -> dict[str, str]:
 
 
 def should_skip_enhancement(path: Path) -> bool:
+    """Backward-compatible guard: long audio is no longer skipped, it is chunked."""
+    return False
+
+
+def should_chunk_enhancement(path: Path) -> bool:
     duration = get_audio_duration_seconds(path)
     return duration is not None and duration > _get_enhancement_max_seconds()
+
+
+def _split_audio_to_chunks(path: Path, work_dir: Path, chunk_seconds: float, duration: float) -> list[Path]:
+    ffmpeg = ffmpeg_executable()
+    if not ffmpeg:
+        raise RuntimeError("ffmpeg is required for chunked DeepFilterNet enhancement")
+
+    chunk_paths: list[Path] = []
+    start = 0.0
+    index = 1
+    while start < duration:
+        chunk_duration = min(chunk_seconds, duration - start)
+        chunk_path = work_dir / f"chunk_{index:04d}.wav"
+        cmd = [
+            ffmpeg,
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-ss",
+            f"{start:.3f}",
+            "-t",
+            f"{chunk_duration:.3f}",
+            "-i",
+            str(path),
+            "-ac",
+            "1",
+            "-ar",
+            "48000",
+            str(chunk_path),
+        ]
+        subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+        if not chunk_path.exists() or chunk_path.stat().st_size == 0:
+            raise RuntimeError(f"Failed to create enhancement chunk {index}")
+        chunk_paths.append(chunk_path)
+        start += chunk_seconds
+        index += 1
+    return chunk_paths
+
+
+def _concat_audio_chunks(chunk_paths: list[Path], output_path: Path) -> None:
+    if not chunk_paths:
+        raise RuntimeError("No enhanced chunks to concatenate")
+
+    ffmpeg = ffmpeg_executable()
+    if not ffmpeg:
+        raise RuntimeError("ffmpeg is required to concatenate enhanced chunks")
+
+    list_path = output_path.with_suffix(".concat.txt")
+    list_lines = []
+    for chunk_path in chunk_paths:
+        normalized = chunk_path.resolve().as_posix().replace("'", "'\\''")
+        list_lines.append(f"file '{normalized}'")
+    list_path.write_text("\n".join(list_lines) + "\n", encoding="utf-8")
+
+    try:
+        cmd = [
+            ffmpeg,
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-f",
+            "concat",
+            "-safe",
+            "0",
+            "-i",
+            str(list_path),
+            "-ac",
+            "1",
+            "-ar",
+            "48000",
+            "-c:a",
+            "pcm_s16le",
+            str(output_path),
+        ]
+        subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+    finally:
+        list_path.unlink(missing_ok=True)
+
+    if not output_path.exists() or output_path.stat().st_size == 0:
+        raise RuntimeError("Chunked DeepFilterNet concatenation produced an empty output")
 
 
 def _get_enhancement_max_seconds() -> float:
@@ -204,3 +319,21 @@ def _get_enhancement_max_seconds() -> float:
     except ValueError:
         return DEFAULT_ENHANCEMENT_MAX_SECONDS
     return max(1.0, value)
+
+
+def _get_enhancement_chunk_seconds() -> float:
+    raw = os.getenv("ENHANCEMENT_CHUNK_SECONDS", str(DEFAULT_ENHANCEMENT_CHUNK_SECONDS)).strip()
+    try:
+        value = float(raw)
+    except ValueError:
+        return DEFAULT_ENHANCEMENT_CHUNK_SECONDS
+    return max(5.0, value)
+
+
+def _get_enhancement_max_chunks() -> int:
+    raw = os.getenv("ENHANCEMENT_MAX_CHUNKS", str(DEFAULT_ENHANCEMENT_MAX_CHUNKS)).strip()
+    try:
+        value = int(raw)
+    except ValueError:
+        return DEFAULT_ENHANCEMENT_MAX_CHUNKS
+    return max(1, value)

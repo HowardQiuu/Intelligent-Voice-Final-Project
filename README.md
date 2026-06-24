@@ -6,7 +6,7 @@
 会议音频输入 -> 语音增强 -> 分块处理 -> 语音分离 -> 自动语音识别 -> 摘要生成 -> 会议纪要输出
 ```
 
-项目当前目标是“稳定可演示 + 接口可替换”。短音频可以接入 SpeechBrain SepFormer 做真实分离；长会议音频会先生成分块计划，并自动跳过高内存模型，避免 30 分钟以上音频把内存占满。
+项目当前目标是“稳定可演示 + 接口可替换”。短音频可以接入 SpeechBrain SepFormer 做真实分离；长会议音频会生成分块计划，语音增强采用分块 DeepFilterNet 推理后拼接，避免 30 分钟以上音频一次性占满内存。
 
 ## 一键启动
 
@@ -81,7 +81,7 @@ backend/app/main.py
 
 - `pipeline_service.py`：完整流水线编排，连接增强、分块、分离、ASR 兜底和摘要。
 - `audio_service.py`：音频目录、上传归一化、时长读取、静态 URL 解析。
-- `enhancement_service.py`：语音增强和长音频跳过策略。
+- `enhancement_service.py`：语音增强和长音频分块增强策略。
 - `chunking_service.py`：长会议音频分块计划。
 - `separation_service.py`：SpeechBrain SepFormer 分离与 placeholder 兜底。
 - `asr_service.py`：ASR 步骤说明和上传音频转写兜底。
@@ -144,9 +144,10 @@ C:\workshop\school lesson\speech signal processing\final_work\train_S\wav\202006
 
 长音频保护策略：
 
-- 超过 `ENHANCEMENT_MAX_SECONDS=300` 秒：跳过 DeepFilterNet 增强。
-- 超过 `SEPARATION_MAX_SECONDS=60` 秒：跳过 SpeechBrain SepFormer。
-- 仍然返回分块计划、增强可视化、兜底分离轨道和摘要结果。
+- 超过 `ENHANCEMENT_MAX_SECONDS=300` 秒：按 `ENHANCEMENT_CHUNK_SECONDS=60` 分块调用 DeepFilterNet，增强后再拼接。
+- 超过 `SEPARATION_MAX_SECONDS=60` 秒：按 `SEPARATION_CHUNK_SECONDS=60` 分块调用 SpeechBrain SepFormer，按说话人轨道拼接。
+- 超过 `ASR_MAX_SECONDS=600` 秒：按 `ASR_CHUNK_SECONDS=60` 分块调用 faster-whisper，并合并全局时间戳。
+- 模型不可用或单块推理失败时，才回退到兜底分离轨道/兜底转写，保证页面不崩。
 
 分块配置：
 
@@ -180,8 +181,10 @@ enhancement_visual_url
 ```text
 SEPARATION_BACKEND=speechbrain
 SEPARATION_MODEL=speechbrain/sepformer-wsj02mix
-SEPARATION_DEVICE=cpu
+SEPARATION_DEVICE=auto
 SEPARATION_MAX_SECONDS=60
+SEPARATION_CHUNK_SECONDS=60
+SEPARATION_MAX_CHUNKS=120
 ```
 
 安装可选依赖：
@@ -192,6 +195,30 @@ backend\.venv\Scripts\python.exe -m pip install -r backend\requirements-separati
 ```
 
 如果模型不可用、音频过长或推理失败，系统会自动回退到 placeholder 轨道，保证页面不崩。
+
+## ASR 转写
+
+上传音频、本地文件和分块上传完成后会优先调用本地 `faster-whisper` 生成转写。默认使用 CPU + int8：
+
+```text
+ASR_BACKEND=faster-whisper
+ASR_MODEL=small
+ASR_DEVICE=auto
+ASR_COMPUTE_TYPE=auto
+ASR_LANGUAGE=zh
+ASR_MAX_SECONDS=600
+ASR_CHUNK_SECONDS=60
+ASR_MAX_CHUNKS=240
+ASR_VAD_FILTER=true
+```
+
+安装可选依赖：
+
+```powershell
+backend\.venv\Scripts\python.exe -m pip install -r backend\requirements-asr.txt
+```
+
+如果未安装模型依赖、首次下载模型失败、音频超过 `ASR_MAX_SECONDS`，系统会自动回退到演示转写，不影响摘要和页面展示。详细说明见 `docs/ASR_SETUP.md`。
 
 ## 摘要生成
 
@@ -226,7 +253,7 @@ docs/LLM_SUMMARY_SETUP.md
 后端测试：
 
 ```powershell
-backend\.venv\Scripts\python.exe -m unittest backend.tests.test_summary_service backend.tests.test_separation_service backend.tests.test_enhancement_service backend.tests.test_chunking_visualization backend.tests.test_upload_session_service
+backend\.venv\Scripts\python.exe -m unittest backend.tests.test_summary_service backend.tests.test_separation_service backend.tests.test_enhancement_service backend.tests.test_chunking_visualization backend.tests.test_upload_session_service backend.tests.test_asr_service
 ```
 
 后端编译检查：
@@ -248,6 +275,7 @@ npm.cmd run build
 - LLM 摘要配置：`docs/LLM_SUMMARY_SETUP.md`
 - DeepFilterNet 增强配置：`docs/DEEPFILTERNET_SETUP.md`
 - SpeechBrain 分离配置：`docs/SPEECH_SEPARATION_SETUP.md`
+- faster-whisper 转写配置：`docs/ASR_SETUP.md`
 
 ## 课堂展示建议
 

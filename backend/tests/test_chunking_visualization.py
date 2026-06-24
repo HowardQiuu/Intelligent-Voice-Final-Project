@@ -38,12 +38,15 @@ class ChunkingVisualizationTest(unittest.TestCase):
     def test_enhancement_visual_generates_svg(self) -> None:
         original = _write_wav("visual_original.wav", seconds=2, amplitude=6000)
         enhanced = _write_wav("visual_enhanced.wav", seconds=2, amplitude=3000)
+        url = None
         try:
             url, metrics = generate_enhancement_visual(original, enhanced, "test")
+            self.assertIsNotNone(url)
             output_path = UPLOAD_DIR / Path(url).name
             self.assertTrue(output_path.exists())
-            self.assertEqual(metrics["增强可视化"], "已生成波形/能量对比图")
-            self.assertIn("平均能量变化", metrics)
+            self.assertEqual(metrics["增强可视化"], "已生成波形/噪声底/清晰度对比图")
+            self.assertIn("噪声底变化", metrics)
+            self.assertIn("清晰度代理变化", metrics)
         finally:
             original.unlink(missing_ok=True)
             enhanced.unlink(missing_ok=True)

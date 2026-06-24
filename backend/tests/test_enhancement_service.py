@@ -23,8 +23,9 @@ class EnhancementServiceTest(unittest.TestCase):
     def tearDown(self) -> None:
         self.env_patch.stop()
 
-    def test_long_upload_skips_deepfilternet(self) -> None:
+    def test_long_upload_uses_chunked_deepfilternet(self) -> None:
         path = UPLOAD_DIR / "long_upload.wav"
+        enhanced = UPLOAD_DIR / "long_upload_deepfilter_chunked.wav"
         path.parent.mkdir(parents=True, exist_ok=True)
         with wave.open(str(path), "wb") as wav:
             wav.setnchannels(1)
@@ -34,15 +35,33 @@ class EnhancementServiceTest(unittest.TestCase):
 
         try:
             with patch.dict(os.environ, {"ENHANCEMENT_MAX_SECONDS": "60"}, clear=True):
-                with patch("app.services.enhancement_service.denoise_audio") as denoise_mock:
+                with patch(
+                    "app.services.enhancement_service.denoise_audio_in_chunks",
+                    return_value=(enhanced, "DeepFilterNet chunked denoise (2 chunks x 60s)"),
+                ) as chunked_mock:
                     result = enhancement_service.enhance_uploaded_audio(path)
         finally:
             path.unlink(missing_ok=True)
 
-        denoise_mock.assert_not_called()
+        chunked_mock.assert_called_once()
         self.assertEqual(result["original_audio_url"], "/static/uploads/long_upload.wav")
-        self.assertEqual(result["enhanced_audio_url"], "/static/uploads/long_upload.wav")
-        self.assertIn("Long audio skipped", result["method"])
+        self.assertEqual(result["enhanced_audio_url"], "/static/uploads/long_upload_deepfilter_chunked.wav")
+        self.assertIn("DeepFilterNet chunked denoise", result["method"])
+
+    def test_should_skip_enhancement_is_false_for_long_audio(self) -> None:
+        path = UPLOAD_DIR / "long_upload_skip_guard.wav"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with wave.open(str(path), "wb") as wav:
+            wav.setnchannels(1)
+            wav.setsampwidth(2)
+            wav.setframerate(8000)
+            wav.writeframes(b"\0\0" * 8000 * 120)
+
+        try:
+            with patch.dict(os.environ, {"ENHANCEMENT_MAX_SECONDS": "60"}, clear=True):
+                self.assertFalse(enhancement_service.should_skip_enhancement(path))
+        finally:
+            path.unlink(missing_ok=True)
 
 
 if __name__ == "__main__":

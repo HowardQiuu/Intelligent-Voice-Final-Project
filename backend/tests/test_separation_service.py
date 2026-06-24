@@ -8,6 +8,8 @@ import wave
 from pathlib import Path
 from unittest.mock import patch
 
+REAL_IMPORT_MODULE = importlib.import_module
+
 
 BACKEND_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(BACKEND_DIR))
@@ -82,7 +84,7 @@ def fake_import_module(name: str):
         return FakeTorch
     if name == "torchaudio":
         return FakeTorchaudio
-    return importlib.import_module(name)
+    return REAL_IMPORT_MODULE(name)
 
 
 class SeparationServiceTest(unittest.TestCase):
@@ -118,7 +120,7 @@ class SeparationServiceTest(unittest.TestCase):
         source_path.write_bytes(b"fake source")
         try:
             with patch.dict(os.environ, {"SEPARATION_BACKEND": "speechbrain"}, clear=True):
-                with patch("app.services.separation_service.importlib.import_module", side_effect=fake_import_module):
+                with patch.object(separation_service.importlib, "import_module", side_effect=fake_import_module):
                     result = separate_uploaded_audio(f"/static/uploads/{source_path.name}")
         finally:
             source_path.unlink(missing_ok=True)
@@ -131,36 +133,55 @@ class SeparationServiceTest(unittest.TestCase):
 
     def test_speechbrain_import_failure_falls_back(self) -> None:
         with patch.dict(os.environ, {"SEPARATION_BACKEND": "speechbrain"}, clear=True):
-            with patch("app.services.separation_service.importlib.import_module", side_effect=ImportError):
+            with patch.object(separation_service.importlib, "import_module", side_effect=ImportError):
                 result = separate_demo_audio("noisy_meeting", "/static/audio/noisy_meeting_enhanced.wav")
 
         self.assertEqual(result["method"], "Placeholder fallback")
         self.assertIn("SpeechBrain failed", result["status"])
 
-    def test_long_audio_skips_speechbrain_before_import(self) -> None:
+    def test_long_audio_uses_chunked_speechbrain(self) -> None:
         source_path = separation_service.UPLOAD_DIR / "long_meeting.wav"
         source_path.parent.mkdir(parents=True, exist_ok=True)
-        with wave.open(str(source_path), "wb") as wav:
-            wav.setnchannels(1)
-            wav.setsampwidth(2)
-            wav.setframerate(8000)
-            wav.writeframes(b"\0\0" * 8000 * 120)
+        _write_wav(source_path, seconds=120)
+
+        def fake_concat(chunk_paths: list[Path], output_path: Path) -> None:
+            output_path.write_bytes(b"joined wav bytes")
 
         try:
             with patch.dict(
                 os.environ,
-                {"SEPARATION_BACKEND": "speechbrain", "SEPARATION_MAX_SECONDS": "60"},
+                {
+                    "SEPARATION_BACKEND": "speechbrain",
+                    "SEPARATION_MAX_SECONDS": "60",
+                    "SEPARATION_CHUNK_SECONDS": "60",
+                },
                 clear=True,
             ):
-                with patch("app.services.separation_service.importlib.import_module") as import_mock:
-                    result = separate_uploaded_audio(f"/static/uploads/{source_path.name}")
+                with patch.object(separation_service.importlib, "import_module", side_effect=fake_import_module):
+                    with patch(
+                        "app.services.separation_service._split_audio_to_chunks",
+                        return_value=[source_path, source_path],
+                    ):
+                        with patch("app.services.separation_service._concat_audio_chunks", side_effect=fake_concat):
+                            result = separate_uploaded_audio(f"/static/uploads/{source_path.name}")
         finally:
             source_path.unlink(missing_ok=True)
+            for path in separation_service.UPLOAD_DIR.glob("upload_*_speaker_*_chunked.wav"):
+                path.unlink(missing_ok=True)
 
-        import_mock.assert_not_called()
-        self.assertEqual(result["method"], "Placeholder fallback")
-        self.assertIn("Audio too long", result["status"])
-        self.assertEqual(result["track_count"], "1")
+        self.assertIn("SpeechBrain SepFormer chunked", result["method"])
+        self.assertEqual(result["status"], "ok-chunked")
+        self.assertEqual(result["track_count"], "2")
+        self.assertEqual(len(result["tracks"]), 2)
+
+
+def _write_wav(path: Path, seconds: int) -> None:
+    sample_rate = 8000
+    with wave.open(str(path), "wb") as wav:
+        wav.setnchannels(1)
+        wav.setsampwidth(2)
+        wav.setframerate(sample_rate)
+        wav.writeframes(b"\0\0" * sample_rate * seconds)
 
 
 if __name__ == "__main__":
