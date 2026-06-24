@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
+import threading
 import uuid
 from pathlib import Path
 from typing import Any
@@ -18,6 +19,8 @@ DEFAULT_ASR_LANGUAGE = "zh"
 DEFAULT_ASR_MAX_SECONDS = 600.0
 DEFAULT_ASR_CHUNK_SECONDS = 60.0
 DEFAULT_ASR_MAX_CHUNKS = 240
+_WHISPER_MODEL_CACHE: dict[tuple[str, str, str], Any] = {}
+_WHISPER_MODEL_CACHE_LOCK = threading.Lock()
 
 
 def build_pipeline_steps(cache_mode: bool = True) -> list[dict]:
@@ -130,19 +133,18 @@ def transcribe_audio(audio_path: Path | None, display_name: str, fallback: dict 
             chunk_seconds=chunk_seconds,
         )
 
+    model_device = device
+    model_compute_type = compute_type
+    cache_status = "miss"
     try:
-        try:
-            model = WhisperModel(model_name, device=device, compute_type=compute_type)
-            model_device = device
-            model_compute_type = compute_type
-            device_status_suffix = ""
-        except Exception:
-            if requested_device != "auto" or device == "cpu":
-                raise
-            model_device = "cpu"
-            model_compute_type = "int8" if requested_compute_type == "auto" else compute_type
-            model = WhisperModel(model_name, device=model_device, compute_type=model_compute_type)
-            device_status_suffix = "-cpu-fallback"
+        model, model_device, model_compute_type, device_status_suffix, cache_status = _get_cached_whisper_model(
+            WhisperModel=WhisperModel,
+            model_name=model_name,
+            device=device,
+            compute_type=compute_type,
+            requested_device=requested_device,
+            requested_compute_type=requested_compute_type,
+        )
         if duration > max_seconds:
             transcript, detected_language = _transcribe_audio_in_chunks(
                 model=model,
@@ -175,6 +177,7 @@ def transcribe_audio(audio_path: Path | None, display_name: str, fallback: dict 
             status=f"failed:{exc.__class__.__name__}",
             segment_count=len(fallback_data.get("transcript", [])),
             chunk_seconds=chunk_seconds,
+            cache_status=cache_status,
         )
 
     if not transcript:
@@ -182,12 +185,13 @@ def transcribe_audio(audio_path: Path | None, display_name: str, fallback: dict 
             fallback_data,
             backend="faster-whisper",
             model=model_name,
-            device=device,
-            compute_type=compute_type,
+            device=model_device,
+            compute_type=model_compute_type,
             language=language,
             status="empty-result",
             segment_count=len(fallback_data.get("transcript", [])),
             chunk_seconds=chunk_seconds,
+            cache_status=cache_status,
         )
 
     text = " ".join(item["text"] for item in transcript)
@@ -198,12 +202,13 @@ def transcribe_audio(audio_path: Path | None, display_name: str, fallback: dict 
         "signal_metrics": _asr_metrics(
             backend="faster-whisper",
             model=model_name,
-            device=device,
-            compute_type=compute_type,
+            device=model_device,
+            compute_type=model_compute_type,
             language=detected_language,
             status=status,
             segment_count=len(transcript),
             chunk_seconds=chunk_seconds,
+            cache_status=cache_status,
         ),
     }
 
@@ -212,6 +217,48 @@ def _load_whisper_model_class():
     from faster_whisper import WhisperModel
 
     return WhisperModel
+
+
+def _get_cached_whisper_model(
+    *,
+    WhisperModel: Any,
+    model_name: str,
+    device: str,
+    compute_type: str,
+    requested_device: str,
+    requested_compute_type: str,
+) -> tuple[Any, str, str, str, str]:
+    try:
+        model, cache_status = _load_cached_whisper_model(WhisperModel, model_name, device, compute_type)
+        return model, device, compute_type, "", cache_status
+    except Exception:
+        if requested_device != "auto" or device == "cpu":
+            raise
+        fallback_device = "cpu"
+        fallback_compute_type = "int8" if requested_compute_type == "auto" else compute_type
+        model, cache_status = _load_cached_whisper_model(
+            WhisperModel,
+            model_name,
+            fallback_device,
+            fallback_compute_type,
+        )
+        return model, fallback_device, fallback_compute_type, "-cpu-fallback", cache_status
+
+
+def _load_cached_whisper_model(
+    WhisperModel: Any,
+    model_name: str,
+    device: str,
+    compute_type: str,
+) -> tuple[Any, str]:
+    cache_key = (model_name, device, compute_type)
+    with _WHISPER_MODEL_CACHE_LOCK:
+        cached = _WHISPER_MODEL_CACHE.get(cache_key)
+        if cached is not None:
+            return cached, "hit"
+        model = WhisperModel(model_name, device=device, compute_type=compute_type)
+        _WHISPER_MODEL_CACHE[cache_key] = model
+        return model, "miss"
 
 
 def _resolve_asr_device_and_compute_type(requested_device: str, requested_compute_type: str) -> tuple[str, str]:
@@ -328,6 +375,7 @@ def _fallback_with_metrics(
     status: str,
     segment_count: int,
     chunk_seconds: float,
+    cache_status: str = "miss",
 ) -> dict:
     return {
         **fallback,
@@ -342,6 +390,7 @@ def _fallback_with_metrics(
                 status=status,
                 segment_count=segment_count,
                 chunk_seconds=chunk_seconds,
+                cache_status=cache_status,
             ),
         },
     }
@@ -357,6 +406,7 @@ def _asr_metrics(
     status: str,
     segment_count: int,
     chunk_seconds: float,
+    cache_status: str = "miss",
 ) -> dict[str, str]:
     return {
         "ASR 后端": backend,
@@ -366,6 +416,7 @@ def _asr_metrics(
         "ASR 语言": language or "auto",
         "ASR 分段数": str(segment_count),
         "ASR 分块窗口": f"{chunk_seconds:.0f}s",
+        "ASR模型缓存": cache_status,
     }
 
 

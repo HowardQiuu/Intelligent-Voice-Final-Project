@@ -10,6 +10,7 @@ from pathlib import Path
 BASE_DIR = Path(__file__).resolve().parents[1]
 STATIC_AUDIO_DIR = BASE_DIR / "static" / "audio"
 UPLOAD_DIR = BASE_DIR / "static" / "uploads"
+UPLOAD_LOUDNESS_FILTER = "highpass=f=80,loudnorm=I=-20:TP=-2:LRA=11,alimiter=limit=0.95"
 
 
 def ensure_audio_dirs() -> None:
@@ -30,28 +31,36 @@ def normalize_upload(input_path: Path, output_name: str) -> Path:
     output_path = UPLOAD_DIR / f"{output_name}.wav"
     if output_path.resolve() == input_path.resolve():
         output_path = UPLOAD_DIR / f"{output_name}_normalized.wav"
-    ffmpeg = _ffmpeg_executable()
-    if ffmpeg:
-        cmd = [
-            ffmpeg,
-            "-y",
-            "-i",
-            str(input_path),
-            "-ac",
-            "1",
-            "-ar",
-            "48000",
-            "-filter:a",
-            "loudnorm",
-            str(output_path),
-        ]
-        try:
-            subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        except (subprocess.CalledProcessError, OSError):
-            shutil.copyfile(input_path, output_path)
-    else:
+    if not apply_audio_filter(input_path, output_path, UPLOAD_LOUDNESS_FILTER):
         shutil.copyfile(input_path, output_path)
     return output_path
+
+
+def apply_audio_filter(input_path: Path, output_path: Path, filter_spec: str, sample_rate: int = 48000) -> bool:
+    """Apply a stable mono WAV ffmpeg filter, returning False when ffmpeg is unavailable or fails."""
+    ffmpeg = _ffmpeg_executable()
+    if not ffmpeg:
+        return False
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    cmd = [
+        ffmpeg,
+        "-y",
+        "-i",
+        str(input_path),
+        "-ac",
+        "1",
+        "-ar",
+        str(sample_rate),
+        "-filter:a",
+        filter_spec,
+        str(output_path),
+    ]
+    try:
+        subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except (subprocess.CalledProcessError, OSError):
+        return False
+    return output_path.exists() and output_path.stat().st_size > 0
 
 
 def _ffmpeg_executable() -> str | None:

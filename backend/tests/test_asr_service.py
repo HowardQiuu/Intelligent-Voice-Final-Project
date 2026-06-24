@@ -12,14 +12,17 @@ from unittest.mock import patch
 BACKEND_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(BACKEND_DIR))
 
+from app.services import asr_service  # noqa: E402
 from app.services.asr_service import fallback_upload_result, transcribe_audio  # noqa: E402
 from app.services.audio_service import UPLOAD_DIR  # noqa: E402
 
 
 class FakeWhisperModel:
     calls: list[str] = []
+    init_count = 0
 
     def __init__(self, model_name: str, device: str, compute_type: str) -> None:
+        type(self).init_count += 1
         self.model_name = model_name
         self.device = device
         self.compute_type = compute_type
@@ -34,9 +37,27 @@ class FakeWhisperModel:
         return segments, SimpleNamespace(language=language)
 
 
+class FailingCudaWhisperModel(FakeWhisperModel):
+    cpu_init_count = 0
+    cuda_init_count = 0
+
+    def __init__(self, model_name: str, device: str, compute_type: str) -> None:
+        if device == "cuda":
+            type(self).cuda_init_count += 1
+            raise RuntimeError("cuda unavailable")
+        type(self).cpu_init_count += 1
+        super().__init__(model_name, device, compute_type)
+
+
 class AsrServiceTest(unittest.TestCase):
     def setUp(self) -> None:
         FakeWhisperModel.calls = []
+        FakeWhisperModel.init_count = 0
+        FailingCudaWhisperModel.calls = []
+        FailingCudaWhisperModel.init_count = 0
+        FailingCudaWhisperModel.cpu_init_count = 0
+        FailingCudaWhisperModel.cuda_init_count = 0
+        asr_service._WHISPER_MODEL_CACHE.clear()
         self.env_patch = patch.dict(os.environ, {}, clear=True)
         self.env_patch.start()
         UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
@@ -107,6 +128,48 @@ class AsrServiceTest(unittest.TestCase):
         self.assertEqual(result["signal_metrics"]["ASR 后端"], "faster-whisper")
         self.assertEqual(len(FakeWhisperModel.calls), 2)
         self.assertEqual(result["transcript"][2]["start"], "01:00")
+
+    def test_faster_whisper_reuses_cached_model(self) -> None:
+        env = {
+            "ASR_BACKEND": "faster-whisper",
+            "ASR_MODEL": "tiny",
+            "ASR_DEVICE": "cpu",
+            "ASR_COMPUTE_TYPE": "int8",
+        }
+        with patch.dict(os.environ, env, clear=True):
+            with patch("app.services.asr_service._load_whisper_model_class", return_value=FakeWhisperModel):
+                first = transcribe_audio(self.audio_path, "meeting.wav")
+                second = transcribe_audio(self.audio_path, "meeting.wav")
+
+        self.assertEqual(FakeWhisperModel.init_count, 1)
+        self.assertEqual(first["signal_metrics"]["ASR模型缓存"], "miss")
+        self.assertEqual(second["signal_metrics"]["ASR模型缓存"], "hit")
+
+    def test_cuda_auto_fallback_reuses_cached_cpu_model(self) -> None:
+        env = {
+            "ASR_BACKEND": "faster-whisper",
+            "ASR_MODEL": "tiny",
+            "ASR_DEVICE": "auto",
+            "ASR_COMPUTE_TYPE": "auto",
+        }
+        with patch.dict(os.environ, env, clear=True):
+            with patch("app.services.asr_service._ctranslate2_cuda_available", return_value=True):
+                with patch("app.services.asr_service._load_whisper_model_class", return_value=FailingCudaWhisperModel):
+                    first = transcribe_audio(self.audio_path, "meeting.wav")
+                    second = transcribe_audio(self.audio_path, "meeting.wav")
+
+        self.assertEqual(FailingCudaWhisperModel.cpu_init_count, 1)
+        self.assertEqual(FailingCudaWhisperModel.cuda_init_count, 2)
+        self.assertEqual(first["signal_metrics"]["ASR 状态"], "success-cpu-fallback")
+        self.assertEqual(second["signal_metrics"]["ASR模型缓存"], "hit")
+
+    def test_placeholder_and_unsupported_backend_do_not_load_model(self) -> None:
+        for backend in ["placeholder", "unknown"]:
+            with patch.dict(os.environ, {"ASR_BACKEND": backend}, clear=True):
+                with patch("app.services.asr_service._load_whisper_model_class") as load_mock:
+                    result = transcribe_audio(self.audio_path, "meeting.wav")
+            load_mock.assert_not_called()
+            self.assertIn("signal_metrics", result)
 
 
 def _write_wav(path: Path, seconds: int) -> None:

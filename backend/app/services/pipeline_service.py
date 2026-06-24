@@ -109,6 +109,7 @@ def process_audio_path(raw_path: Path, display_name: str, case_id: str) -> Proce
         audio = {
             "original_audio_url": audio_url(normalized),
             "enhanced_audio_url": audio_url(normalized),
+            "metrics": _fallback_loudness_metrics(),
             "method": f"上传增强兜底：{_compact_error(exc)}",
         }
     original_path = resolve_static_url(audio["original_audio_url"])
@@ -126,6 +127,7 @@ def process_audio_path(raw_path: Path, display_name: str, case_id: str) -> Proce
         "分离轨道数": separation["track_count"],
         "分块处理": chunk_plan["summary"],
         "分块数量": chunk_plan["chunk_count"],
+        **audio.get("metrics", {}),
         **visual_metrics,
     }
     summary_result = generate_summary(
@@ -166,6 +168,7 @@ def separate_uploaded_path(raw_path: Path, display_name: str) -> dict:
         audio = {
             "original_audio_url": audio_url(normalized),
             "enhanced_audio_url": audio_url(normalized),
+            "metrics": _fallback_loudness_metrics(),
             "method": f"上传增强兜底：{_compact_error(exc)}",
         }
     separation = separate_uploaded_audio(audio["enhanced_audio_url"])
@@ -175,4 +178,12 @@ def separate_uploaded_path(raw_path: Path, display_name: str) -> dict:
         "enhanced_audio_url": audio["enhanced_audio_url"],
         "enhancement_method": audio["method"],
         "separation": separation,
+    }
+
+
+def _fallback_loudness_metrics() -> dict[str, str]:
+    return {
+        "响度预处理": "highpass + loudnorm(-20 LUFS) + limiter",
+        "增强后响度处理": "skipped",
+        "响度处理状态": "fallback",
     }

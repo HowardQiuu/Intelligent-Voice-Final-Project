@@ -5,11 +5,15 @@ import os
 import shutil
 import subprocess
 import sys
+import threading
 import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
+from typing import Any
 
 from .audio_service import (
     UPLOAD_DIR,
+    apply_audio_filter,
     audio_url,
     ffmpeg_executable,
     generate_demo_audio,
@@ -23,6 +27,11 @@ DEFAULT_MODEL_DIR = PROJECT_VENDOR_DIR / "models" / "DeepFilterNet3"
 DEFAULT_ENHANCEMENT_MAX_SECONDS = 300.0
 DEFAULT_ENHANCEMENT_CHUNK_SECONDS = 60.0
 DEFAULT_ENHANCEMENT_MAX_CHUNKS = 120
+DEFAULT_ENHANCEMENT_WORKERS = 2
+POST_ENHANCEMENT_LOUDNESS_FILTER = "highpass=f=80,loudnorm=I=-18:TP=-2:LRA=11,alimiter=limit=0.95"
+_DEEPFILTER_SOURCE_CACHE: dict[str, tuple[Any, Any, str]] = {}
+_DEEPFILTER_SOURCE_CACHE_LOCK = threading.Lock()
+_DEEPFILTER_SOURCE_INFERENCE_LOCK = threading.Lock()
 
 
 def _normalize_model_dir(model_dir: Path) -> Path:
@@ -106,11 +115,11 @@ def denoise_audio_with_source(path: Path) -> tuple[Path, str]:
     model_base_dir = str(model_dir) if model_dir else None
 
     try:
-        init_result = init_df(model_base_dir=model_base_dir, log_file=None)
-        model, df_state = init_result[0], init_result[1]
+        model, df_state, model_name = _get_deepfilternet_source_model(init_df, model_base_dir, model_dir)
         audio, _ = load_audio(str(path), df_state.sr(), "cpu")
-        with torch.no_grad():
-            enhanced = enhance(model, df_state, audio)
+        with _DEEPFILTER_SOURCE_INFERENCE_LOCK:
+            with torch.no_grad():
+                enhanced = enhance(model, df_state, audio)
         save_audio(
             str(path),
             enhanced.to("cpu"),
@@ -129,8 +138,20 @@ def denoise_audio_with_source(path: Path) -> tuple[Path, str]:
     if not output_path.exists() or output_path.stat().st_size == 0:
         raise RuntimeError("DeepFilterNet source inference finished without producing an output WAV file")
 
-    model_name = model_dir.name if model_dir else "default pretrained model"
     return output_path, f"DeepFilterNet source inference ({model_name})"
+
+
+def _get_deepfilternet_source_model(init_df: Any, model_base_dir: str | None, model_dir: Path | None) -> tuple[Any, Any, str]:
+    cache_key = model_base_dir or "__default__"
+    with _DEEPFILTER_SOURCE_CACHE_LOCK:
+        cached = _DEEPFILTER_SOURCE_CACHE.get(cache_key)
+        if cached is not None:
+            return cached
+        init_result = init_df(model_base_dir=model_base_dir, log_file=None)
+        model_name = model_dir.name if model_dir else "default pretrained model"
+        cached = (init_result[0], init_result[1], model_name)
+        _DEEPFILTER_SOURCE_CACHE[cache_key] = cached
+        return cached
 
 
 def denoise_audio_with_cli(path: Path) -> tuple[Path, str]:
@@ -171,7 +192,7 @@ def denoise_audio(path: Path) -> tuple[Path, str]:
     - cli: official deepFilter/deep-filter command. This is the default for classroom demos.
     - source: official source code + pretrained model directory.
     """
-    backend = os.getenv("DEEPFILTERNET_BACKEND", "cli").strip().lower()
+    backend = _get_deepfilternet_backend()
     if backend == "source":
         return denoise_audio_with_source(path)
     if backend == "cli":
@@ -193,13 +214,12 @@ def denoise_audio_in_chunks(path: Path, duration: float) -> tuple[Path, str]:
     chunk_paths = _split_audio_to_chunks(path, work_dir, chunk_seconds, duration)
     enhanced_chunks: list[Path] = []
     try:
-        for chunk_path in chunk_paths:
-            enhanced_path, _ = denoise_audio(chunk_path)
-            enhanced_chunks.append(enhanced_path)
+        enhanced_chunks.extend(_denoise_chunk_paths(chunk_paths))
 
         output_path = UPLOAD_DIR / f"{path.stem}_deepfilter_chunked.wav"
         _concat_audio_chunks(enhanced_chunks, output_path)
-        return output_path, f"DeepFilterNet chunked denoise ({len(enhanced_chunks)} chunks x {chunk_seconds:g}s)"
+        worker_note = _enhancement_parallel_label(len(enhanced_chunks))
+        return output_path, f"DeepFilterNet chunked denoise ({len(enhanced_chunks)} chunks x {chunk_seconds:g}s, {worker_note})"
     finally:
         shutil.rmtree(work_dir, ignore_errors=True)
         for enhanced_path in enhanced_chunks:
@@ -207,16 +227,76 @@ def denoise_audio_in_chunks(path: Path, duration: float) -> tuple[Path, str]:
                 enhanced_path.unlink(missing_ok=True)
 
 
-def enhance_uploaded_audio(path: Path) -> dict[str, str]:
+def _denoise_chunk_paths(chunk_paths: list[Path]) -> list[Path]:
+    backend = _get_deepfilternet_backend()
+    workers = _get_enhancement_workers()
+    if backend != "cli" or workers <= 1 or len(chunk_paths) <= 1:
+        return [_denoise_chunk_path(chunk_path) for chunk_path in chunk_paths]
+
+    indexed_results: list[tuple[int, Path]] = []
+    try:
+        with ThreadPoolExecutor(max_workers=min(workers, len(chunk_paths))) as executor:
+            futures = {
+                executor.submit(_denoise_chunk_path, chunk_path): index
+                for index, chunk_path in enumerate(chunk_paths)
+            }
+            for future in as_completed(futures):
+                indexed_results.append((futures[future], future.result()))
+    except Exception:
+        for _, enhanced_path in indexed_results:
+            if enhanced_path.parent == UPLOAD_DIR and enhanced_path.exists():
+                enhanced_path.unlink(missing_ok=True)
+        raise
+    return [path for _, path in sorted(indexed_results, key=lambda item: item[0])]
+
+
+def _denoise_chunk_path(chunk_path: Path) -> Path:
+    enhanced_path, _ = denoise_audio(chunk_path)
+    return enhanced_path
+
+
+def postprocess_enhanced_audio(path: Path) -> tuple[Path, str]:
+    """Normalize enhanced audio loudness for listening and ASR, falling back to the model output."""
+    output_path = UPLOAD_DIR / f"{path.stem}_loudness.wav"
+    if apply_audio_filter(path, output_path, POST_ENHANCEMENT_LOUDNESS_FILTER):
+        return output_path, "ok"
+    output_path.unlink(missing_ok=True)
+    return path, "fallback"
+
+
+def enhance_uploaded_audio(path: Path) -> dict:
     duration = get_audio_duration_seconds(path)
     if duration is not None and duration > _get_enhancement_max_seconds():
         denoised_path, denoise_method = denoise_audio_in_chunks(path, duration)
     else:
         denoised_path, denoise_method = denoise_audio(path)
+    enhanced_path, loudness_status = postprocess_enhanced_audio(denoised_path)
+    method = denoise_method
+    if loudness_status == "ok":
+        method = f"{denoise_method} + loudness normalization"
     return {
         "original_audio_url": audio_url(path),
-        "enhanced_audio_url": audio_url(denoised_path),
-        "method": denoise_method,
+        "enhanced_audio_url": audio_url(enhanced_path),
+        "method": method,
+        "metrics": {
+            **_loudness_metrics(loudness_status),
+            **_enhancement_runtime_metrics(duration),
+        },
+    }
+
+
+def _loudness_metrics(status: str) -> dict[str, str]:
+    return {
+        "响度预处理": "highpass + loudnorm(-20 LUFS) + limiter",
+        "增强后响度处理": "loudnorm(-18 LUFS) + limiter",
+        "响度处理状态": status,
+    }
+
+
+def _enhancement_runtime_metrics(duration: float | None) -> dict[str, str]:
+    return {
+        "增强分块并行": _enhancement_parallel_label_for_duration(duration),
+        "DeepFilterNet模型缓存": "source-cache" if _get_deepfilternet_backend() == "source" else "cli-process",
     }
 
 
@@ -337,3 +417,30 @@ def _get_enhancement_max_chunks() -> int:
     except ValueError:
         return DEFAULT_ENHANCEMENT_MAX_CHUNKS
     return max(1, value)
+
+
+def _get_deepfilternet_backend() -> str:
+    return os.getenv("DEEPFILTERNET_BACKEND", "cli").strip().lower() or "cli"
+
+
+def _get_enhancement_workers() -> int:
+    raw = os.getenv("ENHANCEMENT_WORKERS", str(DEFAULT_ENHANCEMENT_WORKERS)).strip()
+    try:
+        value = int(raw)
+    except ValueError:
+        return DEFAULT_ENHANCEMENT_WORKERS
+    return max(1, value)
+
+
+def _enhancement_parallel_label(chunk_count: int) -> str:
+    if _get_deepfilternet_backend() == "cli" and chunk_count > 1 and _get_enhancement_workers() > 1:
+        return f"{_get_enhancement_workers()} workers"
+    return "sequential"
+
+
+def _enhancement_parallel_label_for_duration(duration: float | None) -> str:
+    if duration is None or duration <= _get_enhancement_max_seconds():
+        return "sequential"
+    chunk_seconds = _get_enhancement_chunk_seconds()
+    chunk_count = int((duration + chunk_seconds - 0.001) // chunk_seconds)
+    return _enhancement_parallel_label(chunk_count)
