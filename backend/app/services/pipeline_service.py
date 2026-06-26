@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import re
 import shutil
+import time
 import uuid
 from pathlib import Path
 
@@ -101,8 +102,18 @@ def stage_local_file(source_path: Path) -> Path:
 
 
 def process_audio_path(raw_path: Path, display_name: str, case_id: str) -> ProcessResult:
+    timings: dict[str, float] = {}
+    pipeline_start = time.perf_counter()
+
+    stage_start = time.perf_counter()
     normalized = normalize_upload(raw_path, raw_path.stem)
+    timings["runtime_normalize_seconds"] = time.perf_counter() - stage_start
+
+    stage_start = time.perf_counter()
     chunk_plan = build_chunk_plan(normalized)
+    timings["runtime_chunk_plan_seconds"] = time.perf_counter() - stage_start
+
+    stage_start = time.perf_counter()
     try:
         audio = enhance_uploaded_audio(normalized)
     except RuntimeError as exc:
@@ -112,13 +123,22 @@ def process_audio_path(raw_path: Path, display_name: str, case_id: str) -> Proce
             "metrics": _fallback_loudness_metrics(),
             "method": f"上传增强兜底：{_compact_error(exc)}",
         }
+    timings["runtime_enhancement_seconds"] = time.perf_counter() - stage_start
     original_path = resolve_static_url(audio["original_audio_url"])
     enhanced_path = resolve_static_url(audio["enhanced_audio_url"])
+
+    stage_start = time.perf_counter()
     visual_url, visual_metrics = generate_enhancement_visual(original_path, enhanced_path, raw_path.stem)
+    timings["runtime_visual_seconds"] = time.perf_counter() - stage_start
+
+    stage_start = time.perf_counter()
     separation = separate_uploaded_audio(audio["enhanced_audio_url"])
+    timings["runtime_separation_seconds"] = time.perf_counter() - stage_start
 
     fallback = fallback_upload_result(display_name)
+    stage_start = time.perf_counter()
     asr_result = transcribe_audio(enhanced_path, display_name, fallback=fallback)
+    timings["runtime_asr_seconds"] = time.perf_counter() - stage_start
     signal_metrics = {
         **asr_result["signal_metrics"],
         "增强算法": audio["method"],
@@ -130,17 +150,24 @@ def process_audio_path(raw_path: Path, display_name: str, case_id: str) -> Proce
         **audio.get("metrics", {}),
         **visual_metrics,
     }
+    stage_start = time.perf_counter()
     summary_result = generate_summary(
         transcript=asr_result["transcript"],
         case_name=display_name or "上传会议音频",
         enhanced_asr_text=asr_result["enhanced_asr_text"],
         fallback=fallback_summary(),
     )
+    timings["runtime_summary_seconds"] = time.perf_counter() - stage_start
+
+    stage_start = time.perf_counter()
     topic_result = classify_transcript_topics(asr_result["transcript"], display_name or "上传会议音频")
+    timings["runtime_topic_seconds"] = time.perf_counter() - stage_start
+    timings["runtime_total_seconds"] = time.perf_counter() - pipeline_start
     signal_metrics = {
         **signal_metrics,
         **topic_result.metrics,
         **summary_result.metrics,
+        **_format_runtime_metrics(timings),
     }
     return ProcessResult(
         case_id=case_id,
@@ -187,3 +214,7 @@ def _fallback_loudness_metrics() -> dict[str, str]:
         "增强后响度处理": "skipped",
         "响度处理状态": "fallback",
     }
+
+
+def _format_runtime_metrics(timings: dict[str, float]) -> dict[str, str]:
+    return {key: f"{value:.2f}" for key, value in timings.items()}

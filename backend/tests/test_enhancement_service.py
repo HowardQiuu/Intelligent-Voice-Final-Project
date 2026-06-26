@@ -117,6 +117,23 @@ class EnhancementServiceTest(unittest.TestCase):
         finally:
             path.unlink(missing_ok=True)
 
+    def test_skip_backend_reuses_input_audio(self) -> None:
+        path = UPLOAD_DIR / "skip_backend_upload.wav"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"wav")
+
+        try:
+            with patch.dict(os.environ, {"DEEPFILTERNET_BACKEND": "off"}, clear=True):
+                with patch("app.services.enhancement_service.denoise_audio") as denoise_mock:
+                    result = enhancement_service.enhance_uploaded_audio(path)
+        finally:
+            path.unlink(missing_ok=True)
+
+        denoise_mock.assert_not_called()
+        self.assertEqual(result["original_audio_url"], "/static/uploads/skip_backend_upload.wav")
+        self.assertEqual(result["enhanced_audio_url"], "/static/uploads/skip_backend_upload.wav")
+        self.assertIn("Enhancement skipped", result["method"])
+
     def test_cli_chunk_denoise_runs_parallel_and_preserves_concat_order(self) -> None:
         source = UPLOAD_DIR / "parallel_source.wav"
         chunks = [UPLOAD_DIR / f"parallel_chunk_{index}.wav" for index in range(3)]

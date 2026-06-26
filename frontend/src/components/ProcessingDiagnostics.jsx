@@ -29,6 +29,18 @@ const GROUPS = [
   },
 ];
 
+const METRIC_LABELS = {
+  runtime_normalize_seconds: "后端音频归一化耗时",
+  runtime_chunk_plan_seconds: "后端分块规划耗时",
+  runtime_enhancement_seconds: "后端语音增强耗时",
+  runtime_visual_seconds: "后端可视化生成耗时",
+  runtime_separation_seconds: "后端语音分离耗时",
+  runtime_asr_seconds: "后端 ASR 转写耗时",
+  runtime_summary_seconds: "后端摘要生成耗时",
+  runtime_topic_seconds: "后端主题分类耗时",
+  runtime_total_seconds: "后端处理总耗时",
+};
+
 export function ProcessingDiagnostics({ metrics = {} }) {
   const entries = Object.entries(metrics || {});
   if (entries.length === 0) return null;
@@ -78,20 +90,26 @@ export function ProcessingDiagnostics({ metrics = {} }) {
 }
 
 function MetricRow({ label, value }) {
-  const fullValue = formatValue(value);
+  const displayLabel = formatMetricLabel(label);
+  const fullValue = formatValue(value, label);
   const compactValue = compactMetricValue(fullValue);
   const isLong = fullValue.length > 90;
 
   return (
     <p className={`metric-row${isLong ? " metric-row-long" : ""}`}>
-      <span>{label}</span>
+      <span title={label}>{displayLabel}</span>
       <strong title={fullValue}>{compactValue}</strong>
     </p>
   );
 }
 
-function formatValue(value) {
+function formatMetricLabel(label) {
+  return METRIC_LABELS[label] || label;
+}
+
+function formatValue(value, label) {
   if (value === null || value === undefined) return "-";
+  if (label?.startsWith("runtime_")) return `${value} 秒`;
   if (typeof value === "string") return value;
   return JSON.stringify(value);
 }

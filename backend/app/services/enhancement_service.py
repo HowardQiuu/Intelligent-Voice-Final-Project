@@ -28,6 +28,7 @@ DEFAULT_ENHANCEMENT_MAX_SECONDS = 300.0
 DEFAULT_ENHANCEMENT_CHUNK_SECONDS = 60.0
 DEFAULT_ENHANCEMENT_MAX_CHUNKS = 120
 DEFAULT_ENHANCEMENT_WORKERS = 2
+DEFAULT_ENHANCEMENT_SKIP_SECONDS = 0.0
 POST_ENHANCEMENT_LOUDNESS_FILTER = "highpass=f=80,loudnorm=I=-18:TP=-2:LRA=11,alimiter=limit=0.95"
 _DEEPFILTER_SOURCE_CACHE: dict[str, tuple[Any, Any, str]] = {}
 _DEEPFILTER_SOURCE_CACHE_LOCK = threading.Lock()
@@ -266,6 +267,17 @@ def postprocess_enhanced_audio(path: Path) -> tuple[Path, str]:
 
 def enhance_uploaded_audio(path: Path) -> dict:
     duration = get_audio_duration_seconds(path)
+    skip_reason = _enhancement_skip_reason(duration)
+    if skip_reason:
+        return {
+            "original_audio_url": audio_url(path),
+            "enhanced_audio_url": audio_url(path),
+            "method": f"Enhancement skipped ({skip_reason})",
+            "metrics": {
+                **_loudness_metrics("skipped"),
+                **_enhancement_runtime_metrics(duration),
+            },
+        }
     if duration is not None and duration > _get_enhancement_max_seconds():
         denoised_path, denoise_method = denoise_audio_in_chunks(path, duration)
     else:
@@ -301,8 +313,19 @@ def _enhancement_runtime_metrics(duration: float | None) -> dict[str, str]:
 
 
 def should_skip_enhancement(path: Path) -> bool:
-    """Backward-compatible guard: long audio is no longer skipped, it is chunked."""
-    return False
+    duration = get_audio_duration_seconds(path)
+    return bool(_enhancement_skip_reason(duration))
+
+
+def _enhancement_skip_reason(duration: float | None) -> str:
+    backend = _get_deepfilternet_backend()
+    if backend in {"off", "disabled", "placeholder", "skip", "none"}:
+        return f"DEEPFILTERNET_BACKEND={backend}"
+
+    skip_seconds = _get_enhancement_skip_seconds()
+    if skip_seconds > 0 and duration is not None and duration > skip_seconds:
+        return f"duration>{skip_seconds:g}s"
+    return ""
 
 
 def should_chunk_enhancement(path: Path) -> bool:
@@ -421,6 +444,15 @@ def _get_enhancement_max_chunks() -> int:
 
 def _get_deepfilternet_backend() -> str:
     return os.getenv("DEEPFILTERNET_BACKEND", "cli").strip().lower() or "cli"
+
+
+def _get_enhancement_skip_seconds() -> float:
+    raw = os.getenv("ENHANCEMENT_SKIP_SECONDS", str(DEFAULT_ENHANCEMENT_SKIP_SECONDS)).strip()
+    try:
+        value = float(raw)
+    except ValueError:
+        return DEFAULT_ENHANCEMENT_SKIP_SECONDS
+    return max(0.0, value)
 
 
 def _get_enhancement_workers() -> int:

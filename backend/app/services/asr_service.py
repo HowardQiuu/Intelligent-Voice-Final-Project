@@ -19,7 +19,11 @@ DEFAULT_ASR_LANGUAGE = "zh"
 DEFAULT_ASR_MAX_SECONDS = 600.0
 DEFAULT_ASR_CHUNK_SECONDS = 60.0
 DEFAULT_ASR_MAX_CHUNKS = 240
-_WHISPER_MODEL_CACHE: dict[tuple[str, str, str], Any] = {}
+DEFAULT_ASR_BEAM_SIZE = 1
+DEFAULT_ASR_BEST_OF = 1
+DEFAULT_ASR_CPU_THREADS = 0
+DEFAULT_ASR_NUM_WORKERS = 1
+_WHISPER_MODEL_CACHE: dict[tuple[str, str, str, int, int], Any] = {}
 _WHISPER_MODEL_CACHE_LOCK = threading.Lock()
 
 
@@ -64,6 +68,11 @@ def transcribe_audio(audio_path: Path | None, display_name: str, fallback: dict 
     max_seconds = _get_float_env("ASR_MAX_SECONDS", DEFAULT_ASR_MAX_SECONDS)
     chunk_seconds = _get_float_env("ASR_CHUNK_SECONDS", DEFAULT_ASR_CHUNK_SECONDS)
     vad_filter = _get_bool_env("ASR_VAD_FILTER", True)
+    beam_size = _get_int_env("ASR_BEAM_SIZE", DEFAULT_ASR_BEAM_SIZE)
+    best_of = _get_int_env("ASR_BEST_OF", DEFAULT_ASR_BEST_OF)
+    cpu_threads = _get_int_env_allow_zero("ASR_CPU_THREADS", DEFAULT_ASR_CPU_THREADS)
+    num_workers = _get_int_env("ASR_NUM_WORKERS", DEFAULT_ASR_NUM_WORKERS)
+    condition_on_previous_text = _get_bool_env("ASR_CONDITION_ON_PREVIOUS_TEXT", False)
 
     if backend in {"placeholder", "fallback", "disabled"}:
         return _fallback_with_metrics(
@@ -144,6 +153,8 @@ def transcribe_audio(audio_path: Path | None, display_name: str, fallback: dict 
             compute_type=compute_type,
             requested_device=requested_device,
             requested_compute_type=requested_compute_type,
+            cpu_threads=cpu_threads,
+            num_workers=num_workers,
         )
         if duration > max_seconds:
             transcript, detected_language = _transcribe_audio_in_chunks(
@@ -153,14 +164,21 @@ def transcribe_audio(audio_path: Path | None, display_name: str, fallback: dict 
                 chunk_seconds=chunk_seconds,
                 language=language,
                 vad_filter=vad_filter,
+                beam_size=beam_size,
+                best_of=best_of,
+                condition_on_previous_text=condition_on_previous_text,
             )
             status = f"success-chunked{device_status_suffix}"
         else:
-            segments, info = model.transcribe(
+            segments, info = _transcribe_model(
+                model,
                 str(audio_path),
                 language=language or None,
                 vad_filter=vad_filter,
                 word_timestamps=False,
+                beam_size=beam_size,
+                best_of=best_of,
+                condition_on_previous_text=condition_on_previous_text,
             )
             transcript = [_segment_to_transcript(item) for item in segments]
             detected_language = getattr(info, "language", None) or language
@@ -227,9 +245,18 @@ def _get_cached_whisper_model(
     compute_type: str,
     requested_device: str,
     requested_compute_type: str,
+    cpu_threads: int,
+    num_workers: int,
 ) -> tuple[Any, str, str, str, str]:
     try:
-        model, cache_status = _load_cached_whisper_model(WhisperModel, model_name, device, compute_type)
+        model, cache_status = _load_cached_whisper_model(
+            WhisperModel,
+            model_name,
+            device,
+            compute_type,
+            cpu_threads,
+            num_workers,
+        )
         return model, device, compute_type, "", cache_status
     except Exception:
         if requested_device != "auto" or device == "cpu":
@@ -241,6 +268,8 @@ def _get_cached_whisper_model(
             model_name,
             fallback_device,
             fallback_compute_type,
+            cpu_threads,
+            num_workers,
         )
         return model, fallback_device, fallback_compute_type, "-cpu-fallback", cache_status
 
@@ -250,14 +279,25 @@ def _load_cached_whisper_model(
     model_name: str,
     device: str,
     compute_type: str,
+    cpu_threads: int,
+    num_workers: int,
 ) -> tuple[Any, str]:
-    cache_key = (model_name, device, compute_type)
+    cache_key = (model_name, device, compute_type, cpu_threads, num_workers)
     with _WHISPER_MODEL_CACHE_LOCK:
         cached = _WHISPER_MODEL_CACHE.get(cache_key)
         if cached is not None:
             return cached, "hit"
         model_source = _resolve_whisper_model_source(model_name)
-        model = WhisperModel(model_source, device=device, compute_type=compute_type)
+        try:
+            model = WhisperModel(
+                model_source,
+                device=device,
+                compute_type=compute_type,
+                cpu_threads=cpu_threads,
+                num_workers=num_workers,
+            )
+        except TypeError:
+            model = WhisperModel(model_source, device=device, compute_type=compute_type)
         _WHISPER_MODEL_CACHE[cache_key] = model
         return model, "miss"
 
@@ -304,6 +344,9 @@ def _transcribe_audio_in_chunks(
     chunk_seconds: float,
     language: str,
     vad_filter: bool,
+    beam_size: int,
+    best_of: int,
+    condition_on_previous_text: bool,
 ) -> tuple[list[dict], str]:
     chunk_count = int((duration + chunk_seconds - 0.001) // chunk_seconds)
     max_chunks = _get_int_env("ASR_MAX_CHUNKS", DEFAULT_ASR_MAX_CHUNKS)
@@ -317,11 +360,15 @@ def _transcribe_audio_in_chunks(
         transcript: list[dict] = []
         detected_language = language
         for chunk_path, offset in chunks:
-            segments, info = model.transcribe(
+            segments, info = _transcribe_model(
+                model,
                 str(chunk_path),
                 language=language or None,
                 vad_filter=vad_filter,
                 word_timestamps=False,
+                beam_size=beam_size,
+                best_of=best_of,
+                condition_on_previous_text=condition_on_previous_text,
             )
             detected_language = getattr(info, "language", None) or detected_language
             transcript.extend(_segment_to_transcript(item, offset_seconds=offset) for item in segments)
@@ -378,6 +425,18 @@ def _segment_to_transcript(segment: Any, offset_seconds: float = 0.0) -> dict:
         "speaker": "说话人",
         "text": text,
     }
+
+
+def _transcribe_model(model: Any, audio_path: str, **kwargs: Any):
+    try:
+        return model.transcribe(audio_path, **kwargs)
+    except TypeError:
+        compatibility_kwargs = {
+            key: value
+            for key, value in kwargs.items()
+            if key in {"language", "vad_filter", "word_timestamps"}
+        }
+        return model.transcribe(audio_path, **compatibility_kwargs)
 
 
 def _fallback_with_metrics(
@@ -452,6 +511,15 @@ def _get_int_env(name: str, default: int) -> int:
     except ValueError:
         return default
     return max(1, value)
+
+
+def _get_int_env_allow_zero(name: str, default: int) -> int:
+    raw = os.getenv(name, str(default)).strip()
+    try:
+        value = int(raw)
+    except ValueError:
+        return default
+    return max(0, value)
 
 
 def _get_bool_env(name: str, default: bool) -> bool:

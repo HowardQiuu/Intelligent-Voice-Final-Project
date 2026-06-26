@@ -1,5 +1,6 @@
 # Optional real speech separation backend.
-# Install PyTorch CPU wheels first on Windows:
-# backend\.venv\Scripts\python.exe -m pip install torch torchaudio --index-url https://download.pytorch.org/whl/cpu
+# Install CUDA PyTorch wheels first on NVIDIA Windows machines:
+# backend\.venv\Scripts\python.exe -m pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu128
+# Use the CPU index only on machines without a CUDA-capable GPU.
 speechbrain
 soundfile
