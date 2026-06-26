@@ -256,9 +256,25 @@ def _load_cached_whisper_model(
         cached = _WHISPER_MODEL_CACHE.get(cache_key)
         if cached is not None:
             return cached, "hit"
-        model = WhisperModel(model_name, device=device, compute_type=compute_type)
+        model_source = _resolve_whisper_model_source(model_name)
+        model = WhisperModel(model_source, device=device, compute_type=compute_type)
         _WHISPER_MODEL_CACHE[cache_key] = model
         return model, "miss"
+
+
+def _resolve_whisper_model_source(model_name: str) -> str:
+    configured_path = Path(model_name).expanduser()
+    if configured_path.exists():
+        return str(configured_path)
+
+    local_model_dir = Path(__file__).resolve().parents[2] / "models" / "faster-whisper" / _safe_model_dir_name(model_name)
+    if local_model_dir.exists():
+        return str(local_model_dir)
+    return model_name
+
+
+def _safe_model_dir_name(model_name: str) -> str:
+    return model_name.strip().replace("\\", "/").split("/")[-1] or "model"
 
 
 def _resolve_asr_device_and_compute_type(requested_device: str, requested_compute_type: str) -> tuple[str, str]:

@@ -8,7 +8,73 @@
 
 项目当前目标是“稳定可演示 + 接口可替换”。短音频可以接入 SpeechBrain SepFormer 做真实分离；长会议音频会生成分块计划，语音增强采用分块 DeepFilterNet 推理后拼接，避免 30 分钟以上音频一次性占满内存。
 
-## 一键启动
+## 一键安装并启动
+
+首次运行根据系统选择：
+
+```bash
+# macOS / Linux / Git Bash
+bash install.sh
+```
+
+```powershell
+# Windows PowerShell / CMD
+.\install_project.cmd
+```
+
+脚本会自动完成：
+
+- 创建 `backend/.venv` Python 虚拟环境
+- 安装后端基础依赖 `backend/requirements.txt`
+- 安装前端依赖 `frontend/package-lock.json`
+- 清理旧的 `8000` / `5173` 监听进程
+- 启动 FastAPI 后端和 Vite 前端
+
+启动后打开：
+
+```text
+http://127.0.0.1:5173
+```
+
+默认安装的是稳定演示所需的基础环境。真实 ASR、语音分离、DeepFilterNet 降噪依赖体积较大，可按需安装：
+
+```bash
+bash install.sh --with-asr
+bash install.sh --with-separation
+bash install.sh --with-deepfilter
+bash install.sh --full
+bash install.sh --full --download-models
+```
+
+Windows 下对应命令为：
+
+```powershell
+.\install_project.cmd --with-asr
+.\install_project.cmd --with-separation
+.\install_project.cmd --with-deepfilter
+.\install_project.cmd --full
+.\install_project.cmd --full --download-models
+```
+
+只安装依赖、不启动服务：
+
+```bash
+bash install.sh --no-start
+```
+
+```powershell
+.\install_project.cmd --no-start
+```
+
+`install.sh` 启动后按 `Ctrl+C` 可停止本次启动的前后端服务；后端日志在 `.runtime/backend.log`。Windows 脚本会复用下面的 `start_project.cmd`，停止服务可运行 `.\stop_project.cmd`。
+
+多人协作时，推荐先阅读：
+
+```text
+docs/TEAM_SETUP.md
+```
+
+## Windows 一键启动
 
 在项目根目录运行：
 
@@ -56,7 +122,10 @@ Intelligent-Voice-Final-Project/
       styles.css              页面样式
 
   docs/                       模块说明文档
+  scripts/download_models.py  可选模型权重预下载/预热脚本
   scripts/stop_ports.ps1      端口清理脚本
+  install.sh                  一键安装依赖并启动前后端
+  install_project.cmd         Windows 一键安装依赖并启动前后端
   start_project.cmd           一键启动前后端
   stop_project.cmd            一键停止前后端
 ```
@@ -276,6 +345,7 @@ npm.cmd run build
 - DeepFilterNet 增强配置：`docs/DEEPFILTERNET_SETUP.md`
 - SpeechBrain 分离配置：`docs/SPEECH_SEPARATION_SETUP.md`
 - faster-whisper 转写配置：`docs/ASR_SETUP.md`
+- 团队环境复现：`docs/TEAM_SETUP.md`
 
 ## 课堂展示建议
 

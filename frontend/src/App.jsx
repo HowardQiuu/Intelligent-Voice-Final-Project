@@ -1,5 +1,5 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
-import { AudioWaveform, Loader2, Upload } from "lucide-react";
+import { AudioWaveform, FolderOpen, Loader2, Play, Upload } from "lucide-react";
 import {
   fetchDemoCases,
   processDemo,
@@ -36,6 +36,7 @@ export function App() {
     () => cases.find((item) => item.id === selectedCase),
     [cases, selectedCase],
   );
+  const resultStats = useMemo(() => buildResultStats(result), [result]);
 
   async function runDemo(caseId = selectedCase) {
     if (!caseId) return;
@@ -79,7 +80,14 @@ export function App() {
 
   return (
     <main className="app-shell">
-      <Hero loading={loading} selectedCase={selectedCase} onRunDemo={() => runDemo()} uploadRef={uploadRef} />
+      <CommandHeader
+        currentCase={currentCase}
+        loading={loading}
+        resultStats={resultStats}
+        selectedCase={selectedCase}
+        onRunDemo={() => runDemo()}
+        uploadRef={uploadRef}
+      />
       <input ref={uploadRef} className="hidden-input" type="file" accept="audio/*" onChange={uploadAudio} />
 
       <section className="layout">
@@ -114,19 +122,33 @@ export function App() {
   );
 }
 
-function Hero({ loading, selectedCase, onRunDemo, uploadRef }) {
+function CommandHeader({ currentCase, loading, resultStats, selectedCase, onRunDemo, uploadRef }) {
   return (
-    <section className="hero">
-      <div>
-        <p className="eyebrow">智能语音处理课程项目 Demo</p>
-        <h1>复杂会议场景下的智能语音分离与转写系统</h1>
-        <p className="hero-copy">
-          用演示缓存与可替换模型接口跑通语音增强、说话人处理、自动转写和会议纪要生成链路。
-        </p>
+    <section className="command-header">
+      <div className="brand-lockup">
+        <div className="brand-mark">
+          <AudioWaveform size={25} />
+        </div>
+        <div>
+          <p className="eyebrow">VOICE PIPELINE CONSOLE</p>
+          <h1>智能会议语音分离与转写系统</h1>
+          <div className="case-meta">
+            <span>{currentCase?.name || "等待后端样例"}</span>
+            <span>{currentCase?.noise_level || "状态"} / {currentCase?.duration || "未运行"}</span>
+          </div>
+        </div>
       </div>
-      <div className="hero-actions">
+      <div className="result-strip" aria-label="当前处理结果概览">
+        {resultStats.map((item) => (
+          <span key={item.label}>
+            <strong>{item.value}</strong>
+            {item.label}
+          </span>
+        ))}
+      </div>
+      <div className="hero-actions" aria-label="主要操作">
         <button className="primary-btn" onClick={onRunDemo} disabled={loading || !selectedCase}>
-          {loading ? <Loader2 className="spin" size={18} /> : <AudioWaveform size={18} />}
+          {loading ? <Loader2 className="spin" size={18} /> : <Play size={18} />}
           运行样例
         </button>
         <button className="secondary-btn" onClick={() => uploadRef.current?.click()} disabled={loading}>
@@ -150,7 +172,10 @@ function Sidebar({
 }) {
   return (
     <aside className="sidebar">
-      <h2>会议样例</h2>
+      <div className="sidebar-heading">
+        <h2>会议样例</h2>
+        <span>{cases.length} cases</span>
+      </div>
       <div className="case-list">
         {cases.map((item) => (
           <button
@@ -165,7 +190,10 @@ function Sidebar({
         ))}
       </div>
       <div className="local-file-box">
-        <label>高级兜底：本地大文件路径</label>
+        <label>
+          <FolderOpen size={16} />
+          本地大文件路径
+        </label>
         <div className="local-file-row">
           <input
             value={localPath}
@@ -201,4 +229,19 @@ function UploadProgress({ progress }) {
 function formatBytes(bytes = 0) {
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
   return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
+}
+
+function buildResultStats(result) {
+  if (!result) {
+    return [
+      { label: "链路状态", value: "待命" },
+      { label: "分离轨道", value: "0" },
+      { label: "时间戳", value: "0" },
+    ];
+  }
+  return [
+    { label: "链路状态", value: "完成" },
+    { label: "分离轨道", value: String(result.separated_tracks?.length || 0) },
+    { label: "时间戳", value: String(result.transcript?.length || 0) },
+  ];
 }
