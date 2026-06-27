@@ -26,6 +26,11 @@ ASR_MAX_SECONDS=600
 ASR_CHUNK_SECONDS=60
 ASR_MAX_CHUNKS=240
 ASR_VAD_FILTER=true
+ASR_BEAM_SIZE=1
+ASR_BEST_OF=1
+ASR_CPU_THREADS=0
+ASR_NUM_WORKERS=1
+ASR_CONDITION_ON_PREVIOUS_TEXT=false
 ```
 
 常用选择：
@@ -36,6 +41,10 @@ ASR_VAD_FILTER=true
 - `ASR_CHUNK_SECONDS=60`：每个 ASR 分块的窗口长度。
 - `ASR_MAX_CHUNKS=240`：最大分块数量，防止超长音频无限占用机器。
 - `ASR_VAD_FILTER=true`：启用静音过滤，减少无效片段。
+- `ASR_BEAM_SIZE=1` / `ASR_BEST_OF=1`：控制 faster-whisper 解码搜索规模。课堂 CPU 演示推荐保持 1，优先保证速度。
+- `ASR_CPU_THREADS=0`：使用 faster-whisper 默认线程策略；需要限制 CPU 占用时可改成固定线程数。
+- `ASR_NUM_WORKERS=1`：模型推理 worker 数量。单机演示通常保持 1，避免内存占用过高。
+- `ASR_CONDITION_ON_PREVIOUS_TEXT=false`：分块转写时默认不让上一块文本强影响下一块，减少长音频中错误累积。
 
 ## 流水线行为
 
@@ -63,6 +72,8 @@ ASR 语言
 ASR 分段数
 ASR 分块窗口
 ```
+
+同时会返回运行耗时指标，例如 `runtime_asr_seconds` 和 `runtime_total_seconds`，前端会在处理诊断区域展示。
 
 ## 失败兜底
 

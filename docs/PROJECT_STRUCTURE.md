@@ -46,6 +46,8 @@ backend/app/services/
 - `separation_service.py`：SpeechBrain SepFormer 分离与 placeholder 兜底。
 - `asr_service.py`：ASR 流程步骤和上传音频转写兜底。
 - `summary_service.py`：OpenAI-compatible LLM 摘要生成与缓存兜底。
+- `transcript_topic_service.py`：将转写整理成主题时间块，支持 LLM 分类和本地兜底。
+- `upload_session_service.py`：分块上传会话、分片落盘、合并与清理。
 - `visualization_service.py`：增强前后能量包络 SVG 图生成。
 - `demo_cache.py`：内置样例和缓存结果读取。
 
@@ -84,7 +86,8 @@ frontend/src/components/
 - `Pipeline.jsx`：处理链路
 - `AudioCompare.jsx`：增强试听、增强可视化、分离轨道、分块计划
 - `Transcript.jsx`：带时间戳转写
-- `Summary.jsx`：会议纪要和处理指标
+- `Summary.jsx`：会议纪要
+- `ProcessingDiagnostics.jsx`：后端耗时、模型状态和兜底原因等处理诊断
 - `EmptyState.jsx`：初始/加载状态
 
 ```text
@@ -98,3 +101,9 @@ frontend/src/styles.css
 主上传入口已经改为分块上传：前端使用 `File.slice` 将音频切成小块，后端将分片落盘并在完成后合并，再进入增强、分离、转写和摘要流水线。默认分片大小为 `UPLOAD_CHUNK_MB=4`。
 
 页面侧边栏的“高级兜底：本地大文件路径”仍保留，用于浏览器上传受限或文件就在后端机器上的特殊情况。
+
+## 运行诊断与主题转写
+
+完整处理结果会在 `signal_metrics` 中返回阶段耗时和模型状态，例如 `runtime_enhancement_seconds`、`runtime_asr_seconds`、`runtime_summary_seconds`、`runtime_topic_seconds` 和 `runtime_total_seconds`。前端通过 `ProcessingDiagnostics.jsx` 展示这些字段，便于判断当前耗时集中在哪个阶段。
+
+转写展示优先使用后端返回的 `transcript_topics`。如果启用了 LLM 且配置了 Key，主题分组由 `transcript_topic_service.py` 调用 OpenAI-compatible API 生成；如果没有 Key、关闭了 `LLM_ENABLED` 或调用失败，则使用本地时间块兜底，页面仍然可以正常展示。

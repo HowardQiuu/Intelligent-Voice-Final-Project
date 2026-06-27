@@ -67,6 +67,9 @@ SEPARATION_MAX_SECONDS=60
 SEPARATION_CHUNK_SECONDS=60
 SEPARATION_MAX_CHUNKS=120
 ENHANCEMENT_MAX_SECONDS=300
+ENHANCEMENT_CHUNK_SECONDS=60
+ENHANCEMENT_MAX_CHUNKS=120
+ENHANCEMENT_WORKERS=2
 ```
 
 如果希望保持稳定演示模式：
@@ -124,6 +127,10 @@ SEPARATION_BACKEND=placeholder
 ```text
 POST /api/process-demo/{case_id}
 POST /api/upload
+POST /api/upload-session
+POST /api/upload-session/{upload_id}/chunk
+POST /api/upload-session/{upload_id}/complete
+POST /api/process-local-file
 ```
 
 单独调试语音分离模块可以使用：

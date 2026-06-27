@@ -155,6 +155,8 @@ backend/app/main.py
 - `separation_service.py`：SpeechBrain SepFormer 分离与 placeholder 兜底。
 - `asr_service.py`：ASR 步骤说明和上传音频转写兜底。
 - `summary_service.py`：OpenAI-compatible LLM 摘要生成与缓存兜底。
+- `transcript_topic_service.py`：按时间块组织转写，并用 LLM 或兜底逻辑生成主题分组。
+- `upload_session_service.py`：分块上传会话、分片落盘和合并。
 - `visualization_service.py`：增强前后能量包络 SVG 图生成。
 - `demo_cache.py`：内置样例和缓存结果读取。
 
@@ -178,7 +180,8 @@ frontend/src/api.js
 - `Pipeline.jsx`：处理链路。
 - `AudioCompare.jsx`：增强试听、增强可视化、分离轨道、分块计划。
 - `Transcript.jsx`：带时间戳转写。
-- `Summary.jsx`：会议纪要和处理指标。
+- `Summary.jsx`：会议纪要。
+- `ProcessingDiagnostics.jsx`：后端耗时、模型状态和兜底原因等处理诊断。
 - `EmptyState.jsx`：初始和加载状态。
 
 ## 大文件处理
@@ -203,6 +206,8 @@ POST /api/upload-session/{upload_id}/complete
 UPLOAD_CHUNK_MB=4
 ```
 
+前端默认使用 `VITE_UPLOAD_CHUNK_MB=4` 作为兜底分片大小；如果后端创建上传会话时返回了 `chunk_size_bytes`，页面会优先使用后端值。
+
 页面侧边栏仍保留“高级兜底：本地大文件路径”入口。它适合浏览器上传被系统策略拦截、文件位于后端同一台机器、或需要完全绕过浏览器传输时使用，例如：
 
 ```text
@@ -216,6 +221,7 @@ C:\workshop\school lesson\speech signal processing\final_work\train_S\wav\202006
 - 超过 `ENHANCEMENT_MAX_SECONDS=300` 秒：按 `ENHANCEMENT_CHUNK_SECONDS=60` 分块调用 DeepFilterNet，增强后再拼接。
 - 超过 `SEPARATION_MAX_SECONDS=60` 秒：按 `SEPARATION_CHUNK_SECONDS=60` 分块调用 SpeechBrain SepFormer，按说话人轨道拼接。
 - 超过 `ASR_MAX_SECONDS=600` 秒：按 `ASR_CHUNK_SECONDS=60` 分块调用 faster-whisper，并合并全局时间戳。
+- 如需演示时跳过 DeepFilterNet，可设置 `DEEPFILTERNET_BACKEND=off`；如需仅对超长音频跳过增强，可设置 `ENHANCEMENT_SKIP_SECONDS`。
 - 模型不可用或单块推理失败时，才回退到兜底分离轨道/兜底转写，保证页面不崩。
 
 分块配置：
@@ -242,6 +248,24 @@ enhancement_visual_url
 - 增强后峰值
 
 这样展示时可以用“图 + 数据”说明增强效果。
+
+## 处理诊断
+
+后端会把各阶段耗时和模型状态写入 `signal_metrics`，前端 `ProcessingDiagnostics.jsx` 会集中展示。常见字段包括：
+
+```text
+runtime_normalize_seconds
+runtime_chunk_plan_seconds
+runtime_enhancement_seconds
+runtime_visual_seconds
+runtime_separation_seconds
+runtime_asr_seconds
+runtime_summary_seconds
+runtime_topic_seconds
+runtime_total_seconds
+```
+
+这些指标适合在调试或汇报时说明瓶颈位置，例如 DeepFilterNet 增强、SpeechBrain 分离、ASR 转写或 LLM 主题分类分别耗时多少，以及当前结果是否来自真实模型或兜底路径。
 
 ## 语音分离
 
@@ -279,6 +303,11 @@ ASR_MAX_SECONDS=600
 ASR_CHUNK_SECONDS=60
 ASR_MAX_CHUNKS=240
 ASR_VAD_FILTER=true
+ASR_BEAM_SIZE=1
+ASR_BEST_OF=1
+ASR_CPU_THREADS=0
+ASR_NUM_WORKERS=1
+ASR_CONDITION_ON_PREVIOUS_TEXT=false
 ```
 
 安装可选依赖：
@@ -307,9 +336,11 @@ LLM_API_KEY=填写你的 API Key
 LLM_BASE_URL=https://api.deepseek.com/v1
 LLM_MODEL=deepseek-chat
 LLM_TIMEOUT_SECONDS=20
+LLM_TOPIC_WINDOW_SECONDS=120
+LLM_TOPIC_MAX_BLOCKS=80
 ```
 
-稳定演示模式默认 `LLM_ENABLED=false`，直接使用缓存/兜底摘要。需要展示真实 LLM 摘要时，再改为 `LLM_ENABLED=true` 并配置 Key。
+稳定演示推荐设置 `LLM_ENABLED=false`，直接使用缓存/兜底摘要和兜底主题分组。`backend/.env.example` 展示的是真实 LLM 接入形态；如果没有配置 `LLM_API_KEY` 或接口失败，系统仍会自动回退。需要展示真实 LLM 摘要和主题分组时，设置 `LLM_ENABLED=true` 并配置 Key。
 
 详细教程见：
 
@@ -322,7 +353,7 @@ docs/LLM_SUMMARY_SETUP.md
 后端测试：
 
 ```powershell
-backend\.venv\Scripts\python.exe -m unittest backend.tests.test_summary_service backend.tests.test_separation_service backend.tests.test_enhancement_service backend.tests.test_chunking_visualization backend.tests.test_upload_session_service backend.tests.test_asr_service
+backend\.venv\Scripts\python.exe -m unittest backend.tests.test_audio_service backend.tests.test_summary_service backend.tests.test_separation_service backend.tests.test_enhancement_service backend.tests.test_chunking_visualization backend.tests.test_upload_session_service backend.tests.test_asr_service
 ```
 
 后端编译检查：
