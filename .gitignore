@@ -1,8 +1,14 @@
 api.txt
+backend-*.log
 backend/.env
 backend/.venv/
+backend/.runtime/
+backend/models/
+backend/app/static/uploads/*
+!backend/app/static/uploads/.gitkeep
 __pycache__/
 *.py[cod]
 frontend/node_modules/
 frontend/dist/
 frontend/.vite/
+.runtime/

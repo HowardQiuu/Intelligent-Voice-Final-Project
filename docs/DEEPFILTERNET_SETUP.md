@@ -34,6 +34,22 @@ uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
 
 如果不设置 `DEEPFILTERNET_BACKEND`，系统默认也是 `cli`。
 
+常用运行参数：
+
+```text
+DEEPFILTERNET_BACKEND=cli
+ENHANCEMENT_MAX_SECONDS=300
+ENHANCEMENT_CHUNK_SECONDS=60
+ENHANCEMENT_MAX_CHUNKS=120
+ENHANCEMENT_WORKERS=2
+ENHANCEMENT_SKIP_SECONDS=0
+```
+
+- `ENHANCEMENT_MAX_SECONDS`：超过该时长后进入分块增强，不再一次性把整段音频送入 DeepFilterNet。
+- `ENHANCEMENT_CHUNK_SECONDS` / `ENHANCEMENT_MAX_CHUNKS`：控制每块时长和最大块数，避免超长音频占满机器。
+- `ENHANCEMENT_WORKERS`：CLI 后端分块增强时的并行 worker 数。课堂机器性能有限时可设为 `1`。
+- `ENHANCEMENT_SKIP_SECONDS=0`：默认不按时长跳过增强。设置为正数后，超过该秒数的音频会直接复用归一化后的音频，适合只想演示后续 ASR/摘要链路的场景。
+
 上传音频时，后端流程为：
 
 ```text
@@ -99,6 +115,22 @@ backend/app/services/enhancement_service.py
 - `denoise_audio_with_cli()`：官方 CLI 调用方式。
 - `denoise_audio_with_source()`：源码 + 权重调用方式，保留备用。
 - `denoise_audio()`：根据 `DEEPFILTERNET_BACKEND` 选择后端，默认走 CLI。
+
+如果希望完全跳过 DeepFilterNet，可设置：
+
+```text
+DEEPFILTERNET_BACKEND=off
+```
+
+同样支持 `disabled`、`placeholder`、`skip`、`none` 作为跳过值。跳过时流水线仍会继续执行分离、ASR、摘要和主题分组，并在处理指标中写明跳过原因。
+
+处理结果中的诊断指标还会显示增强分块并行方式和模型缓存/进程策略，例如：
+
+```text
+增强分块并行：2 workers
+DeepFilterNet模型缓存：cli-process
+runtime_enhancement_seconds
+```
 
 ## 汇报时的表述建议
 

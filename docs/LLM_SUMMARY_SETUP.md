@@ -66,10 +66,13 @@ Copy-Item backend\.env.example backend\.env
 然后打开 `backend/.env`，填写：
 
 ```text
+LLM_ENABLED=true
 LLM_API_KEY=这里填写你的 DeepSeek API Key
 LLM_BASE_URL=https://api.deepseek.com/v1
 LLM_MODEL=deepseek-chat
 LLM_TIMEOUT_SECONDS=20
+LLM_TOPIC_WINDOW_SECONDS=120
+LLM_TOPIC_MAX_BLOCKS=80
 ```
 
 然后启动后端：
@@ -85,6 +88,7 @@ uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
 ### OpenAI
 
 ```text
+LLM_ENABLED=true
 LLM_API_KEY=你的 OpenAI API Key
 LLM_BASE_URL=https://api.openai.com/v1
 LLM_MODEL=gpt-4o-mini
@@ -96,13 +100,30 @@ LLM_TIMEOUT_SECONDS=20
 如果本地模型服务兼容 `/chat/completions`：
 
 ```text
+LLM_ENABLED=true
 LLM_API_KEY=local-key
 LLM_BASE_URL=http://127.0.0.1:8001/v1
 LLM_MODEL=local-chat-model
 LLM_TIMEOUT_SECONDS=60
 ```
 
-## 5. 启动前端并验证
+## 5. 转写主题分组
+
+同一组 LLM 配置也会用于 `transcript_topic_service.py`。它会把 ASR 结果按时间窗口整理为主题块，再请求 OpenAI-compatible API 输出主题标题、摘要和对应时间块。
+
+可调参数：
+
+```text
+LLM_TOPIC_WINDOW_SECONDS=120
+LLM_TOPIC_MAX_BLOCKS=80
+```
+
+- `LLM_TOPIC_WINDOW_SECONDS`：每个候选主题时间块的窗口大小，最小值为 30 秒。
+- `LLM_TOPIC_MAX_BLOCKS`：发送给模型的最大时间块数量，最小值为 8，避免超长会议 prompt 过大。
+
+`LLM_ENABLED=false` 会同时关闭真实摘要和真实主题分类，系统会使用缓存/兜底摘要以及本地时间块主题分组。没有配置 `LLM_API_KEY` 或接口调用失败时，也会自动回退，不影响页面展示。
+
+## 6. 启动前端并验证
 
 另开一个 PowerShell 窗口：
 
@@ -126,6 +147,8 @@ http://127.0.0.1:5173
 摘要生成：LLM API
 摘要模型：deepseek-chat
 摘要状态：结构化 JSON 生成成功
+转写主题来源：LLM API
+转写主题数量：...
 ```
 
 如果没有配置 API Key，或接口调用失败，会看到类似内容：
@@ -134,6 +157,7 @@ http://127.0.0.1:5173
 摘要生成：缓存兜底
 摘要模型：deepseek-chat
 摘要状态：未配置 LLM_API_KEY
+转写主题来源：本地兜底
 ```
 
 或：
@@ -144,7 +168,7 @@ http://127.0.0.1:5173
 
 这表示系统自动回退到了缓存摘要，Demo 仍然可以正常展示。
 
-## 6. 快速接口测试
+## 7. 快速接口测试
 
 后端启动后，可以直接访问健康检查：
 
@@ -171,9 +195,11 @@ summary.action_items
 signal_metrics.摘要生成
 signal_metrics.摘要模型
 signal_metrics.摘要状态
+signal_metrics.转写主题来源
+signal_metrics.转写主题数量
 ```
 
-## 7. 常见问题
+## 8. 常见问题
 
 ### 1. 页面显示“缓存兜底”
 
@@ -211,7 +237,7 @@ LLM_TIMEOUT_SECONDS=60
 
 把这一行写入 `backend/.env` 后重启后端。
 
-## 8. 课堂展示讲解词
+## 9. 课堂展示讲解词
 
 可以这样介绍摘要生成模块：
 
@@ -221,9 +247,10 @@ LLM_TIMEOUT_SECONDS=60
 模型必须返回固定 JSON，包括会议标题、关键词、摘要、关键决策和待办事项。
 为了保证课堂演示稳定，我们设计了失败兜底机制：如果没有配置 API Key、网络异常或模型输出格式错误，系统会自动使用缓存摘要。
 页面上的处理指标会显示摘要来源、模型名称和调用状态，因此可以清楚看到当前结果是由 LLM API 生成，还是由缓存兜底生成。
+转写区域会按主题展示时间块；如果开启 LLM 主题分类，主题标题和摘要由模型生成，如果关闭或失败，则使用本地兜底分组。
 ```
 
-## 9. 最小演示流程
+## 10. 最小演示流程
 
 1. 启动后端前配置 `LLM_API_KEY`、`LLM_BASE_URL` 和 `LLM_MODEL`。
 2. 启动 FastAPI 后端。
