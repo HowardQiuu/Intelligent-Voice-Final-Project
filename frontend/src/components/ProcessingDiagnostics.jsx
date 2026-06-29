@@ -3,6 +3,28 @@ import { Activity, AudioLines, FileText, ListChecks, Settings2 } from "lucide-re
 
 const GROUPS = [
   {
+    title: "自适应策略",
+    icon: Settings2,
+    match: (key) =>
+      key.includes("主处理后端") ||
+      key.includes("中文ASR模型") ||
+      key.includes("自适应路由") ||
+      key.includes("会议提取质量评分") ||
+      key.includes("语音覆盖率") ||
+      key.includes("疑似重叠比例") ||
+      key.includes("静音比例"),
+  },
+  {
+    title: "说话人画像",
+    icon: AudioLines,
+    match: (key) =>
+      key.includes("检测说话人数") ||
+      key.includes("说话人分段模型") ||
+      key.includes("说话人会议画像") ||
+      key.includes("按说话人摘要") ||
+      key.includes("SenseVoice事件标签"),
+  },
+  {
     title: "ASR 转写",
     icon: FileText,
     match: (key) => key.startsWith("ASR") || key.includes("转写主题"),

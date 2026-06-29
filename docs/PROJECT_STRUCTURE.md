@@ -43,7 +43,7 @@ backend/app/services/
 - `audio_service.py`：音频目录、上传归一化、音频时长读取、静态 URL 解析。
 - `enhancement_service.py`：语音增强与长音频分块增强策略。
 - `chunking_service.py`：长会议音频分块计划。
-- `separation_service.py`：SpeechBrain SepFormer 分离与 placeholder 兜底。
+- `separation_service.py`：默认根据 FunASR/CAM++ 说话人时间段生成可试听轨道；SpeechBrain SepFormer 保留为可选实验分离后端。
 - `asr_service.py`：ASR 流程步骤和上传音频转写兜底。
 - `summary_service.py`：OpenAI-compatible LLM 摘要生成与缓存兜底。
 - `transcript_topic_service.py`：将转写整理成主题时间块，支持 LLM 分类和本地兜底。

@@ -7,7 +7,7 @@ export function AudioCompare({ result }) {
     <section className="panel audio-panel">
       <div className="panel-title">
         <FileAudio size={20} />
-        <h2>增强后音频与转写</h2>
+        <h2>增强音频与中文会议转写</h2>
       </div>
 
       <div className="audio-grid">
@@ -30,7 +30,7 @@ export function AudioCompare({ result }) {
 
       {result.separated_tracks?.length > 0 && (
         <div className="separation-list">
-          <h3>语音分离轨道</h3>
+          <h3>说话人轨道 / 分离轨道</h3>
           <div className="track-grid">
             {result.separated_tracks.map((track) => (
               <div className="audio-card separated" key={track.track_id}>
@@ -67,7 +67,9 @@ function ChunkPlan({ chunks }) {
         {chunks.slice(0, 8).map((chunk) => (
           <div className="chunk-item" key={chunk.chunk_id}>
             <strong>{chunk.chunk_id}</strong>
-            <span>{chunk.start} - {chunk.end}</span>
+            <span>
+              {chunk.start} - {chunk.end}
+            </span>
             <small>{chunk.status}</small>
           </div>
         ))}

@@ -61,6 +61,18 @@ class FakeClient:
         return FakeResponse(json_module.dumps(content, ensure_ascii=False))
 
 
+class LowInfoFakeClient(FakeClient):
+    def post(self, url, headers, json):
+        content = {
+            "title": "未知会议",
+            "keywords": ["未知"],
+            "abstract": "由于会议转写内容不完整，无法生成摘要。",
+            "decisions": ["无决策"],
+            "action_items": ["无待办事项"],
+        }
+        return FakeResponse(json_module.dumps(content, ensure_ascii=False))
+
+
 json_module = json
 
 
@@ -84,6 +96,19 @@ class SummaryServiceTest(unittest.TestCase):
         self.assertEqual(result.summary["title"], "缓存摘要")
         self.assertEqual(result.metrics["摘要生成"], "缓存兜底")
         self.assertEqual(result.metrics["摘要状态"], "未配置 LLM_API_KEY")
+
+    def test_static_upload_fallback_uses_transcript_content(self) -> None:
+        result = generate_summary(
+            transcript=SAMPLE_TRANSCRIPT,
+            case_name="测试会议",
+            enhanced_asr_text="今天讨论摘要模块，需要接入大语言模型 API。",
+        )
+
+        self.assertFalse(result.used_llm)
+        self.assertNotEqual(result.summary["title"], "上传会议音频演示结果")
+        self.assertIn("测试会议", result.summary["title"])
+        self.assertTrue(any("摘要" in item or "语言模型" in item for item in result.summary["keywords"]))
+        self.assertEqual(result.metrics["摘要生成"], "本地转写兜底")
 
     def test_llm_disabled_uses_fallback_even_with_api_key(self) -> None:
         with patch.dict(os.environ, {"LLM_API_KEY": "test-key", "LLM_ENABLED": "false"}, clear=True):
@@ -121,6 +146,20 @@ class SummaryServiceTest(unittest.TestCase):
         self.assertEqual(result.summary["title"], "LLM 会议纪要")
         self.assertEqual(result.metrics["摘要生成"], "LLM API")
         self.assertEqual(result.metrics["摘要状态"], "结构化 JSON 生成成功")
+
+    @patch("app.services.summary_service.httpx.Client", LowInfoFakeClient)
+    def test_low_information_llm_output_falls_back_to_transcript_summary(self) -> None:
+        with patch.dict(os.environ, {"LLM_API_KEY": "test-key"}, clear=True):
+            result = generate_summary(
+                transcript=SAMPLE_TRANSCRIPT,
+                case_name="测试会议",
+                enhanced_asr_text="今天讨论摘要模块，需要接入大语言模型 API。",
+            )
+
+        self.assertFalse(result.used_llm)
+        self.assertNotEqual(result.summary["title"], "未知会议")
+        self.assertEqual(result.metrics["摘要生成"], "本地转写兜底")
+        self.assertIn("ValueError", result.metrics["摘要状态"])
 
 
 if __name__ == "__main__":

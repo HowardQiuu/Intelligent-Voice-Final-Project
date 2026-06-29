@@ -11,7 +11,7 @@ from typing import Any
 from .audio_service import UPLOAD_DIR, ffmpeg_executable, get_audio_duration_seconds
 
 
-DEFAULT_ASR_BACKEND = "faster-whisper"
+DEFAULT_ASR_BACKEND = "funasr"
 DEFAULT_ASR_MODEL = "small"
 DEFAULT_ASR_DEVICE = "auto"
 DEFAULT_ASR_COMPUTE_TYPE = "auto"
@@ -86,6 +86,29 @@ def transcribe_audio(audio_path: Path | None, display_name: str, fallback: dict 
             segment_count=len(fallback_data.get("transcript", [])),
             chunk_seconds=chunk_seconds,
         )
+
+    if backend == "funasr":
+        try:
+            from .funasr_service import transcribe_audio_with_funasr
+
+            if audio_path is None or not audio_path.exists():
+                raise FileNotFoundError("audio-not-found")
+            return transcribe_audio_with_funasr(audio_path, display_name)
+        except Exception as exc:
+            fallback_data = {
+                **fallback_data,
+                "signal_metrics": {
+                    **fallback_data.get("signal_metrics", {}),
+                    "ASR 后端": "funasr",
+                    "ASR 状态": f"funasr-fallback:{exc.__class__.__name__}",
+                    "主处理后端": "FunASR不可用，自动回退",
+                    "中文ASR模型": os.getenv("FUNASR_MODEL", os.getenv("ASR_MODEL", "iic/SenseVoiceSmall")),
+                    "说话人分段模型": os.getenv("FUNASR_SPK_MODEL", "cam++"),
+                    "自适应路由说明": "FunASR/SenseVoice加载或推理失败，已回退到faster-whisper或演示兜底。",
+                },
+            }
+            backend = "faster-whisper"
+            model_name = os.getenv("FASTER_WHISPER_MODEL", DEFAULT_ASR_MODEL).strip() or DEFAULT_ASR_MODEL
 
     if backend != "faster-whisper":
         return _fallback_with_metrics(

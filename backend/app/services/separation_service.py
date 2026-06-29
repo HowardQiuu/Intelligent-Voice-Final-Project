@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib
+import math
 import os
 import shutil
 import subprocess
@@ -46,6 +47,36 @@ def separate_uploaded_audio(enhanced_audio_url: str) -> dict:
         output_stem=f"upload_{uuid.uuid4().hex[:8]}",
         fallback=fallback,
     )
+
+
+def build_speaker_tracks_from_transcript(enhanced_audio_url: str, transcript: list[dict]) -> dict:
+    """Create stable per-speaker listening tracks from diarized transcript intervals.
+
+    This is intentionally a meeting-diarization track, not a claim of hard blind-source
+    waveform separation. Non-target speaker regions are attenuated so the classroom demo
+    can audibly inspect each speaker stream while keeping the full meeting timeline.
+    """
+    source_path = _resolve_static_url(enhanced_audio_url)
+    fallback = _placeholder_upload_result(enhanced_audio_url)
+    intervals = _speaker_intervals(transcript)
+    if source_path is None or not source_path.exists():
+        return _with_fallback_status(fallback, "Fallback enhanced mix: enhanced audio file not found")
+    if not intervals:
+        return _with_fallback_status(fallback, "Fallback enhanced mix: no speaker timestamps")
+
+    try:
+        tracks = _write_gated_speaker_tracks(source_path, intervals)
+    except Exception as exc:
+        return _with_fallback_status(fallback, f"Fallback enhanced mix: gated track failed: {_short_error(exc)}")
+
+    if not tracks:
+        return _with_fallback_status(fallback, "Fallback enhanced mix: no speaker tracks generated")
+    return {
+        "method": "FunASR speaker diarization gated tracks",
+        "status": "ok-diarization-gated",
+        "track_count": str(len(tracks)),
+        "tracks": tracks,
+    }
 
 
 def _separate_audio(source_path: Path | None, source_url: str, output_stem: str, fallback: dict) -> dict:
@@ -405,6 +436,106 @@ def _concat_audio_chunks(chunk_paths: list[Path], output_path: Path) -> None:
 
     if not output_path.exists() or output_path.stat().st_size == 0:
         raise RuntimeError("Chunked separation concatenation produced an empty output")
+
+
+def _speaker_intervals(transcript: list[dict]) -> dict[str, list[tuple[float, float]]]:
+    grouped: dict[str, list[tuple[float, float]]] = {}
+    speaker_aliases: dict[str, str] = {}
+    for item in transcript or []:
+        text = str(item.get("text") or "").strip()
+        if not text:
+            continue
+        start = _parse_timestamp(item.get("start"))
+        end = _parse_timestamp(item.get("end"))
+        if math.isnan(start) or math.isnan(end) or end <= start:
+            continue
+        raw_speaker = str(item.get("speaker") or "").strip() or "说话人 A"
+        speaker = speaker_aliases.setdefault(raw_speaker, _stable_speaker_label(raw_speaker, len(speaker_aliases)))
+        grouped.setdefault(speaker, []).append((start, end))
+    return {speaker: _merge_intervals(intervals) for speaker, intervals in grouped.items()}
+
+
+def _write_gated_speaker_tracks(source_path: Path, intervals: dict[str, list[tuple[float, float]]]) -> list[dict]:
+    soundfile = importlib.import_module("soundfile")
+    data, sample_rate = soundfile.read(str(source_path), always_2d=True, dtype="float32")
+    if len(data) == 0 or sample_rate <= 0:
+        raise RuntimeError("Source audio is empty")
+
+    tracks = []
+    background_gain = _get_gated_background_gain()
+    for index, (speaker, speaker_intervals) in enumerate(sorted(intervals.items()), start=1):
+        output = data * background_gain
+        for start, end in speaker_intervals:
+            start_sample = max(0, min(len(data), int(start * sample_rate)))
+            end_sample = max(start_sample, min(len(data), int(end * sample_rate)))
+            if end_sample > start_sample:
+                output[start_sample:end_sample, :] = data[start_sample:end_sample, :]
+
+        safe_label = _safe_filename(speaker)
+        output_path = UPLOAD_DIR / f"{source_path.stem}_{safe_label}_diarized.wav"
+        soundfile.write(str(output_path), output, sample_rate)
+        speech_seconds = sum(max(0.0, end - start) for start, end in speaker_intervals)
+        tracks.append(
+            {
+                "track_id": f"{source_path.stem}_{safe_label}",
+                "label": speaker,
+                "audio_url": audio_url(output_path),
+                "description": (
+                    "FunASR speaker diarization gated track: "
+                    f"保留{speaker}时间段原声，其他说话人区域低增益，讲话约{speech_seconds:.0f}s。"
+                ),
+            }
+        )
+    return tracks
+
+
+def _parse_timestamp(value: Any) -> float:
+    if isinstance(value, (int, float)):
+        return float(value)
+    if not value:
+        return math.nan
+    try:
+        parts = [float(part) for part in str(value).split(":")]
+    except ValueError:
+        return math.nan
+    if len(parts) == 2:
+        return parts[0] * 60 + parts[1]
+    if len(parts) == 3:
+        return parts[0] * 3600 + parts[1] * 60 + parts[2]
+    return math.nan
+
+
+def _merge_intervals(intervals: list[tuple[float, float]]) -> list[tuple[float, float]]:
+    merged: list[tuple[float, float]] = []
+    for start, end in sorted(intervals):
+        if not merged or start > merged[-1][1]:
+            merged.append((start, end))
+        else:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+    return merged
+
+
+def _stable_speaker_label(raw_speaker: str, index: int) -> str:
+    if raw_speaker.startswith("说话人 "):
+        return raw_speaker
+    if raw_speaker.startswith("璇磋瘽浜"):
+        suffix = chr(ord("A") + index) if index < 26 else str(index + 1)
+        return f"说话人 {suffix}"
+    return raw_speaker
+
+
+def _safe_filename(value: str) -> str:
+    cleaned = "".join(ch if ch.isalnum() else "_" for ch in value).strip("_")
+    return cleaned or "speaker"
+
+
+def _get_gated_background_gain() -> float:
+    raw = os.getenv("SPEAKER_TRACK_BACKGROUND_GAIN", "0.05").strip()
+    try:
+        value = float(raw)
+    except ValueError:
+        return 0.05
+    return min(0.5, max(0.0, value))
 
 
 def _trim_sources(sources: Any, max_seconds: float) -> Any:

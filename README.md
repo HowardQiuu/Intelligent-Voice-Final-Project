@@ -6,7 +6,7 @@
 会议音频输入 -> 语音增强 -> 分块处理 -> 语音分离 -> 自动语音识别 -> 摘要生成 -> 会议纪要输出
 ```
 
-项目当前目标是“稳定可演示 + 接口可替换”。短音频可以接入 SpeechBrain SepFormer 做真实分离；长会议音频会生成分块计划，语音增强采用分块 DeepFilterNet 推理后拼接，避免 30 分钟以上音频一次性占满内存。
+项目当前目标是“稳定可演示 + 接口可替换”。完整会议提取主流程现在优先采用中文会议路线：DeepFilterNet 增强后调用 FunASR/SenseVoice + VAD + CAM++ 生成带说话人标签的中文转写，再根据说话人时间段生成可试听轨道和质量评分。SpeechBrain SepFormer 保留为独立实验分离后端；faster-whisper 保留为 FunASR 不可用时的 ASR 回退。
 
 ## 一键安装并启动
 
@@ -152,7 +152,7 @@ backend/app/main.py
 - `audio_service.py`：音频目录、上传归一化、时长读取、静态 URL 解析。
 - `enhancement_service.py`：语音增强和长音频分块增强策略。
 - `chunking_service.py`：长会议音频分块计划。
-- `separation_service.py`：SpeechBrain SepFormer 分离与 placeholder 兜底。
+- `separation_service.py`：说话人时间段轨道生成、可选 SpeechBrain SepFormer 分离与 placeholder 兜底。
 - `asr_service.py`：ASR 步骤说明和上传音频转写兜底。
 - `summary_service.py`：OpenAI-compatible LLM 摘要生成与缓存兜底。
 - `transcript_topic_service.py`：按时间块组织转写，并用 LLM 或兜底逻辑生成主题分组。
@@ -219,8 +219,9 @@ C:\workshop\school lesson\speech signal processing\final_work\train_S\wav\202006
 长音频保护策略：
 
 - 超过 `ENHANCEMENT_MAX_SECONDS=300` 秒：按 `ENHANCEMENT_CHUNK_SECONDS=60` 分块调用 DeepFilterNet，增强后再拼接。
-- 超过 `SEPARATION_MAX_SECONDS=60` 秒：按 `SEPARATION_CHUNK_SECONDS=60` 分块调用 SpeechBrain SepFormer，按说话人轨道拼接。
-- 超过 `ASR_MAX_SECONDS=600` 秒：按 `ASR_CHUNK_SECONDS=60` 分块调用 faster-whisper，并合并全局时间戳。
+- 完整 pipeline 默认先执行 FunASR/SenseVoice + VAD + CAM++，再根据转写中的说话人时间段生成说话人轨道。
+- 只有在独立分离接口或显式配置 `SEPARATION_BACKEND=speechbrain` 时，才调用 SpeechBrain SepFormer。
+- FunASR 不可用时，上传流程会自动回退到 faster-whisper；超过 `ASR_MAX_SECONDS=600` 秒时 faster-whisper 回退路径按 `ASR_CHUNK_SECONDS=60` 分块转写。
 - 如需演示时跳过 DeepFilterNet，可设置 `DEEPFILTERNET_BACKEND=off`；如需仅对超长音频跳过增强，可设置 `ENHANCEMENT_SKIP_SECONDS`。
 - 模型不可用或单块推理失败时，才回退到兜底分离轨道/兜底转写，保证页面不崩。
 
@@ -291,11 +292,15 @@ backend\.venv\Scripts\python.exe -m pip install -r backend\requirements-separati
 
 ## ASR 转写
 
-上传音频、本地文件和分块上传完成后会优先调用本地 `faster-whisper` 生成转写。默认使用 CPU + int8：
+上传音频、本地文件和分块上传完成后会优先调用 FunASR/SenseVoice 生成中文会议转写、VAD 分段和 CAM++ 说话人标签；如果 FunASR 不可用，则自动回退到本地 `faster-whisper`。推荐配置：
 
 ```text
-ASR_BACKEND=faster-whisper
-ASR_MODEL=small
+ASR_BACKEND=funasr
+FUNASR_MODEL=iic/SenseVoiceSmall
+FUNASR_VAD_MODEL=fsmn-vad
+FUNASR_SPK_MODEL=cam++
+FUNASR_DEVICE=auto
+FASTER_WHISPER_MODEL=small
 ASR_DEVICE=auto
 ASR_COMPUTE_TYPE=auto
 ASR_LANGUAGE=zh
@@ -385,5 +390,21 @@ npm.cmd run build
 1. 运行内置“带噪会议片段”，说明完整链路。
 2. 展示增强前后试听和增强可视化图。
 3. 展示分块处理计划，说明长会议音频如何避免内存爆掉。
-4. 展示分离轨道，说明短音频可接入真实 SepFormer，长音频稳定兜底。
+4. 展示说话人轨道，说明完整 pipeline 优先使用 FunASR/SenseVoice + VAD + CAM++；SpeechBrain SepFormer 是可选实验后端。
 5. 展示结构化会议纪要：主题、关键词、摘要、关键决策、待办事项。
+# 中文会议 Pipeline 升级说明
+
+新的默认设计面向中文课堂/会议展示：
+
+```text
+DeepFilterNet 增强 -> FunASR/SenseVoice 中文ASR -> fsmn-vad + cam++ 说话人分段 -> 说话人轨道 -> 主题转写 -> 会议纪要 -> 质量评分
+```
+
+核心创新点：
+
+- 中文会议自适应路由：FunASR 不可用时自动回退到 faster-whisper 或演示兜底。
+- 说话人轨道：根据说话人时间段生成可试听轨道，说明来源为 `FunASR speaker diarization gated track`。
+- 会议质量评估：输出语音覆盖率、疑似重叠比例、检测说话人数和 0-100 会议提取质量评分。
+- 可解释诊断：前端展示主处理后端、中文ASR模型、说话人分段模型和路由说明。
+
+详细说明见 `docs/CHINESE_MEETING_PIPELINE.md`。

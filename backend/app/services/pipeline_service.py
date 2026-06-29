@@ -15,7 +15,8 @@ from .audio_service import UPLOAD_DIR, audio_url, normalize_upload, resolve_stat
 from .chunking_service import build_chunk_plan
 from .demo_cache import get_case, get_result
 from .enhancement_service import enhance_demo_audio, enhance_uploaded_audio
-from .separation_service import separate_demo_audio, separate_uploaded_audio
+from .pipeline_analysis_service import build_meeting_analysis_metrics
+from .separation_service import build_speaker_tracks_from_transcript, separate_uploaded_audio
 from .summary_service import fallback_summary, generate_summary
 from .transcript_topic_service import classify_transcript_topics
 from .visualization_service import generate_enhancement_visual
@@ -45,7 +46,6 @@ def process_demo_case(case_id: str) -> ProcessResult:
     enhanced_path = resolve_static_url(audio["enhanced_audio_url"])
     chunk_plan = build_chunk_plan(enhanced_path)
     visual_url, visual_metrics = generate_enhancement_visual(original_path, enhanced_path, case_id)
-    separation = separate_demo_audio(case_id, audio["enhanced_audio_url"])
     summary_result = generate_summary(
         transcript=cached["transcript"],
         case_name=case["name"],
@@ -53,6 +53,13 @@ def process_demo_case(case_id: str) -> ProcessResult:
         fallback=cached["summary"],
     )
     topic_result = classify_transcript_topics(cached["transcript"], case["name"])
+    separation = build_speaker_tracks_from_transcript(audio["enhanced_audio_url"], cached["transcript"])
+    analysis_metrics = build_meeting_analysis_metrics(
+        audio_path=enhanced_path,
+        transcript=cached["transcript"],
+        asr_metrics=cached.get("signal_metrics", {}),
+        separation=separation,
+    )
     signal_metrics = {
         **cached["signal_metrics"],
         "分离算法": separation["method"],
@@ -63,6 +70,7 @@ def process_demo_case(case_id: str) -> ProcessResult:
         **visual_metrics,
         **topic_result.metrics,
         **summary_result.metrics,
+        **analysis_metrics,
     }
     return ProcessResult(
         case_id=case_id,
@@ -131,14 +139,23 @@ def process_audio_path(raw_path: Path, display_name: str, case_id: str) -> Proce
     visual_url, visual_metrics = generate_enhancement_visual(original_path, enhanced_path, raw_path.stem)
     timings["runtime_visual_seconds"] = time.perf_counter() - stage_start
 
-    stage_start = time.perf_counter()
-    separation = separate_uploaded_audio(audio["enhanced_audio_url"])
-    timings["runtime_separation_seconds"] = time.perf_counter() - stage_start
-
     fallback = fallback_upload_result(display_name)
     stage_start = time.perf_counter()
     asr_result = transcribe_audio(enhanced_path, display_name, fallback=fallback)
     timings["runtime_asr_seconds"] = time.perf_counter() - stage_start
+
+    stage_start = time.perf_counter()
+    separation = build_speaker_tracks_from_transcript(audio["enhanced_audio_url"], asr_result["transcript"])
+    if separation.get("method") == "Placeholder fallback":
+        separation = separate_uploaded_audio(audio["enhanced_audio_url"])
+    timings["runtime_separation_seconds"] = time.perf_counter() - stage_start
+
+    analysis_metrics = build_meeting_analysis_metrics(
+        audio_path=enhanced_path,
+        transcript=asr_result["transcript"],
+        asr_metrics=asr_result.get("signal_metrics", {}),
+        separation=separation,
+    )
     signal_metrics = {
         **asr_result["signal_metrics"],
         "增强算法": audio["method"],
@@ -149,6 +166,7 @@ def process_audio_path(raw_path: Path, display_name: str, case_id: str) -> Proce
         "分块数量": chunk_plan["chunk_count"],
         **audio.get("metrics", {}),
         **visual_metrics,
+        **analysis_metrics,
     }
     stage_start = time.perf_counter()
     summary_result = generate_summary(

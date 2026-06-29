@@ -221,3 +221,27 @@ result.separated_tracks
 当前演示版本默认使用占位分离轨道保证稳定；如果安装 SpeechBrain 依赖并配置 speechbrain 后端，系统会调用 SepFormer 预训练模型输出多个说话人音轨。
 后端已经预留了独立分离接口和完整流水线中的 separated_tracks 字段，因此后续替换为更适合会议场景的分离模型时不需要重写前端和主流程。
 ```
+# 当前版本说明：默认不是 SepFormer
+
+完整会议提取 pipeline 当前默认不再优先调用 SpeechBrain SepFormer。实际顺序是：
+
+```text
+DeepFilterNet 增强
+-> FunASR/SenseVoice 中文ASR
+-> fsmn-vad + cam++ 说话人分段
+-> build_speaker_tracks_from_transcript 生成说话人轨道
+-> 摘要、主题分类、质量评分
+```
+
+也就是说，`result.separated_tracks` 在完整 pipeline 中默认来自说话人时间段轨道，描述字段会包含：
+
+```text
+FunASR speaker diarization gated track
+```
+
+SpeechBrain SepFormer 仍然保留，但只在以下情况使用：
+
+- 调用独立分离接口 `/api/separate-demo/{case_id}` 或 `/api/separate-upload`；
+- 或在完整 pipeline 中说话人轨道生成失败后回到 `separate_uploaded_audio`，并且显式设置了 `SEPARATION_BACKEND=speechbrain`。
+
+如果没有显式设置，`SEPARATION_BACKEND` 默认是 `placeholder`，不会自动优先调用 SepFormer。

@@ -36,7 +36,7 @@ export function App() {
     () => cases.find((item) => item.id === selectedCase),
     [cases, selectedCase],
   );
-  const resultStats = useMemo(() => buildResultStats(result), [result]);
+  const resultStats = useMemo(() => buildMeetingResultStats(result), [result]);
 
   async function runDemo(caseId = selectedCase) {
     if (!caseId) return;
@@ -229,6 +229,29 @@ function UploadProgress({ progress }) {
 function formatBytes(bytes = 0) {
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
   return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
+}
+
+function buildMeetingResultStats(result) {
+  if (!result) {
+    return [
+      { label: "链路状态", value: "待命" },
+      { label: "说话人数", value: "0" },
+      { label: "质量评分", value: "-" },
+      { label: "时间戳", value: "0" },
+    ];
+  }
+  const metrics = result.signal_metrics || {};
+  return [
+    { label: "链路状态", value: "完成" },
+    { label: "说话人数", value: metricValue(metrics, "检测说话人数", String(result.separated_tracks?.length || 0)) },
+    { label: "质量评分", value: metricValue(metrics, "会议提取质量评分", "-") },
+    { label: "语音覆盖", value: metricValue(metrics, "语音覆盖率", "-") },
+    { label: "时间戳", value: String(result.transcript?.length || 0) },
+  ];
+}
+
+function metricValue(metrics, key, fallback) {
+  return metrics?.[key] || fallback;
 }
 
 function buildResultStats(result) {

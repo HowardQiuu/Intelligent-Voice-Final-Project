@@ -1,6 +1,6 @@
 # 团队环境复现说明
 
-本文档用于让新的维护者把本项目配置到和当前主开发环境一致的能力边界：前后端可启动、可选真实 ASR、可选 SpeechBrain 语音分离、可选 DeepFilterNet 增强、可选 LLM 摘要。
+本文档用于让新的维护者把本项目配置到和当前主开发环境一致的能力边界：前后端可启动、默认 FunASR/SenseVoice 中文会议 ASR + VAD + CAM++ 说话人分段、可选 SpeechBrain 语音分离、可选 DeepFilterNet 增强、可选 LLM 摘要。
 
 ## 1. 从零安装并启动
 
@@ -63,7 +63,12 @@ SEPARATION_DEVICE=auto
 SEPARATION_MAX_SECONDS=60
 SEPARATION_CHUNK_SECONDS=60
 SEPARATION_MAX_CHUNKS=120
-ASR_BACKEND=faster-whisper
+ASR_BACKEND=funasr
+FUNASR_MODEL=iic/SenseVoiceSmall
+FUNASR_VAD_MODEL=fsmn-vad
+FUNASR_SPK_MODEL=cam++
+FUNASR_DEVICE=auto
+FASTER_WHISPER_MODEL=small
 ASR_MODEL=small
 ASR_DEVICE=auto
 ASR_COMPUTE_TYPE=auto
@@ -94,8 +99,9 @@ VITE_MAX_BROWSER_UPLOAD_MB=120
 
 当前模型来源：
 
-- `faster-whisper`：`--download-models --with-asr` 会下载 `ASR_MODEL` 指定的模型，默认 `small`，项目本地缓存目录为 `backend/models/faster-whisper/small`。
-- `SpeechBrain SepFormer`：`--download-models --with-separation` 会下载 `speechbrain/sepformer-wsj02mix`，项目本地缓存目录为 `backend/models/speechbrain/sepformer-wsj02mix`。
+- `FunASR/SenseVoice`：完整 pipeline 默认优先使用 `FUNASR_MODEL=iic/SenseVoiceSmall`、`FUNASR_VAD_MODEL=fsmn-vad`、`FUNASR_SPK_MODEL=cam++`。
+- `faster-whisper`：FunASR 不可用时的回退 ASR，默认使用 `FASTER_WHISPER_MODEL=small` 或本地 `backend/models/faster-whisper/small`。
+- `SpeechBrain SepFormer`：只作为独立/实验分离后端，`--download-models --with-separation` 会下载 `speechbrain/sepformer-wsj02mix`。
 - `DeepFilterNet`：`--download-models --with-deepfilter` 会运行一次 CLI 预热。默认 `DEEPFILTERNET_BACKEND=cli`，通常不需要手动管理 `.ckpt`。只有切到 `DEEPFILTERNET_BACKEND=source` 时，才需要配置 `DEEPFILTERNET_SOURCE_DIR` 和 `DEEPFILTERNET_MODEL_DIR`。
 - `LLM`：不下载本地权重，调用 OpenAI-compatible API。需要每个人自己配置 Key。
 
@@ -132,7 +138,7 @@ ASR_MODEL=small
 SEPARATION_MODEL=speechbrain/sepformer-wsj02mix
 ```
 
-应用会优先使用 `backend/models/faster-whisper/small` 里的本地 Whisper 模型；SpeechBrain 会使用 `backend/models/speechbrain/sepformer-wsj02mix`。
+应用完整 pipeline 会优先使用 FunASR/SenseVoice + VAD + CAM++；FunASR 不可用时才回退到本地 Whisper 模型。SpeechBrain 仅在显式启用 `SEPARATION_BACKEND=speechbrain` 或调用独立分离接口时使用。
 
 不要提交以下文件：
 
