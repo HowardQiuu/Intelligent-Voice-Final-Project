@@ -19,6 +19,12 @@ from .audio_service import (
     generate_demo_audio,
     get_audio_duration_seconds,
 )
+from .audio_quality_service import (
+    analyze_audio_quality,
+    apply_audibility_pregain,
+    quality_metric_strings,
+    score_enhancement_candidate,
+)
 
 BACKEND_DIR = Path(__file__).resolve().parents[2]
 PROJECT_VENDOR_DIR = BACKEND_DIR / "vendor" / "DeepFilterNet"
@@ -33,6 +39,14 @@ POST_ENHANCEMENT_LOUDNESS_FILTER = "highpass=f=80,loudnorm=I=-18:TP=-2:LRA=11,al
 _DEEPFILTER_SOURCE_CACHE: dict[str, tuple[Any, Any, str]] = {}
 _DEEPFILTER_SOURCE_CACHE_LOCK = threading.Lock()
 _DEEPFILTER_SOURCE_INFERENCE_LOCK = threading.Lock()
+_CLEARVOICE_ENHANCER_CACHE: dict[tuple[str, str], Any] = {}
+_CLEARVOICE_ENHANCER_LOCK = threading.Lock()
+
+
+def _prepare_clearvoice_runtime() -> None:
+    runtime_dir = BACKEND_DIR / ".runtime" / "numba_cache"
+    runtime_dir.mkdir(parents=True, exist_ok=True)
+    os.environ.setdefault("NUMBA_CACHE_DIR", str(runtime_dir))
 
 
 def _normalize_model_dir(model_dir: Path) -> Path:
@@ -105,6 +119,8 @@ def denoise_audio_with_source(path: Path) -> tuple[Path, str]:
             "requirements, or install DeepFilterNet in editable mode from its source tree."
         ) from exc
 
+    _patch_torchaudio_legacy_io()
+
     init_df = enhance_module.init_df
     load_audio = enhance_module.load_audio
     enhance = enhance_module.enhance
@@ -140,6 +156,49 @@ def denoise_audio_with_source(path: Path) -> tuple[Path, str]:
         raise RuntimeError("DeepFilterNet source inference finished without producing an output WAV file")
 
     return output_path, f"DeepFilterNet source inference ({model_name})"
+
+
+def _patch_torchaudio_legacy_io() -> None:
+    """Route DeepFilterNet's torchaudio IO calls through soundfile for WAV compatibility."""
+    try:
+        torchaudio = importlib.import_module("torchaudio")
+        soundfile = importlib.import_module("soundfile")
+        torch = importlib.import_module("torch")
+        from types import SimpleNamespace
+
+        def info(path: str, **_kwargs):
+            metadata = soundfile.info(path)
+            return SimpleNamespace(
+                sample_rate=metadata.samplerate,
+                num_frames=metadata.frames,
+                num_channels=metadata.channels,
+                bits_per_sample=0,
+                encoding=str(metadata.subtype or ""),
+            )
+
+        def load(path: str, frame_offset: int = 0, num_frames: int = -1, channels_first: bool = True, **_kwargs):
+            stop = None if num_frames is None or num_frames < 0 else frame_offset + num_frames
+            data, sample_rate = soundfile.read(
+                path,
+                start=max(0, frame_offset),
+                stop=stop,
+                always_2d=True,
+                dtype="float32",
+            )
+            tensor = torch.from_numpy(data.T.copy() if channels_first else data.copy())
+            return tensor, sample_rate
+
+        def save(path: str, tensor, sample_rate: int, **_kwargs):
+            audio = tensor.detach().cpu().numpy() if hasattr(tensor, "detach") else tensor
+            if getattr(audio, "ndim", 0) == 2 and audio.shape[0] <= audio.shape[1]:
+                audio = audio.T
+            soundfile.write(path, audio, sample_rate)
+
+        torchaudio.info = info
+        torchaudio.load = load
+        torchaudio.save = save
+    except Exception:
+        return
 
 
 def _get_deepfilternet_source_model(init_df: Any, model_base_dir: str | None, model_dir: Path | None) -> tuple[Any, Any, str]:
@@ -278,22 +337,224 @@ def enhance_uploaded_audio(path: Path) -> dict:
                 **_enhancement_runtime_metrics(duration),
             },
         }
-    if duration is not None and duration > _get_enhancement_max_seconds():
-        denoised_path, denoise_method = denoise_audio_in_chunks(path, duration)
-    else:
-        denoised_path, denoise_method = denoise_audio(path)
-    enhanced_path, loudness_status = postprocess_enhanced_audio(denoised_path)
-    method = denoise_method
-    if loudness_status == "ok":
-        method = f"{denoise_method} + loudness normalization"
+
+    original_quality = analyze_audio_quality(path)
+    candidate_input, pregain_status, pregain_metrics = apply_audibility_pregain(path)
+    candidate_duration = get_audio_duration_seconds(candidate_input) or duration
+
+    if not _quality_router_enabled():
+        denoised_path, denoise_method = _run_deepfilternet_candidate(candidate_input, candidate_duration)
+        enhanced_path, loudness_status = postprocess_enhanced_audio(denoised_path)
+        method = denoise_method
+        if loudness_status == "ok":
+            method = f"{denoise_method} + loudness normalization"
+        enhanced_quality = analyze_audio_quality(enhanced_path)
+        return {
+            "original_audio_url": audio_url(path),
+            "enhanced_audio_url": audio_url(enhanced_path),
+            "method": method,
+            "metrics": {
+                **pregain_metrics,
+                **quality_metric_strings("enhancement_selected", enhanced_quality),
+                **_loudness_metrics(loudness_status),
+                **_enhancement_runtime_metrics(duration),
+                "quality_router_status": "disabled",
+                "quality_pregain_status": pregain_status,
+            },
+        }
+
+    selected = _select_enhancement_candidate(candidate_input, candidate_duration, original_quality)
+    enhanced_path = selected["path"]
+    method = selected["method"]
     return {
         "original_audio_url": audio_url(path),
         "enhanced_audio_url": audio_url(enhanced_path),
         "method": method,
         "metrics": {
-            **_loudness_metrics(loudness_status),
+            **pregain_metrics,
+            **selected["metrics"],
+            **_loudness_metrics(selected["loudness_status"]),
             **_enhancement_runtime_metrics(duration),
+            "quality_router_status": "enabled",
+            "quality_pregain_status": pregain_status,
         },
+    }
+
+
+def _run_deepfilternet_candidate(path: Path, duration: float | None) -> tuple[Path, str]:
+    if duration is not None and duration > _get_enhancement_max_seconds():
+        return denoise_audio_in_chunks(path, duration)
+    return denoise_audio(path)
+
+
+def _select_enhancement_candidate(path: Path, duration: float | None, original_quality) -> dict:
+    attempts = []
+    for candidate in _get_enhancement_candidates():
+        try:
+            denoised_path, denoise_method = _run_enhancement_candidate(candidate, path, duration)
+            enhanced_path, loudness_status = postprocess_enhanced_audio(denoised_path)
+            quality = analyze_audio_quality(enhanced_path)
+            score = score_enhancement_candidate(original_quality, quality)
+            attempts.append(
+                {
+                    "candidate": candidate,
+                    "path": enhanced_path,
+                    "method": f"{denoise_method} + loudness normalization + quality score {score:.1f}",
+                    "score": score,
+                    "quality": quality,
+                    "loudness_status": loudness_status,
+                    "status": "ok",
+                }
+            )
+        except Exception as exc:
+            attempts.append(
+                {
+                    "candidate": candidate,
+                    "score": -1.0,
+                    "status": f"skipped: {_short_error(exc)}",
+                }
+            )
+
+    valid = [item for item in attempts if item.get("status") == "ok"]
+    if not valid:
+        fallback_quality = analyze_audio_quality(path)
+        return {
+            "path": path,
+            "method": "Audibility pregain fallback (no enhancement candidate succeeded)",
+            "loudness_status": "fallback",
+            "metrics": {
+                **quality_metric_strings("enhancement_selected", fallback_quality),
+                **_candidate_metrics(attempts, "pregain-fallback"),
+                "quality_router_selected_score": f"{score_enhancement_candidate(original_quality, fallback_quality):.1f}",
+            },
+        }
+
+    selected = max(valid, key=lambda item: item["score"])
+    return {
+        "path": selected["path"],
+        "method": selected["method"],
+        "loudness_status": selected["loudness_status"],
+        "metrics": {
+            **quality_metric_strings("enhancement_selected", selected["quality"]),
+            **_candidate_metrics(attempts, selected["candidate"]),
+            "quality_router_selected_score": f"{selected['score']:.1f}",
+        },
+    }
+
+
+def _run_enhancement_candidate(candidate: str, path: Path, duration: float | None) -> tuple[Path, str]:
+    if candidate == "deepfilternet":
+        return _run_deepfilternet_candidate(path, duration)
+    if candidate == "clearvoice":
+        return _run_clearvoice_enhancement_candidate(path)
+    if candidate == "voicefixer":
+        return _run_external_enhancement_candidate(
+            path,
+            output_suffix="voicefixer",
+            command_env="VOICEFIXER_ENHANCE_COMMAND",
+            label="VoiceFixer restoration",
+        )
+    raise RuntimeError(f"Unsupported enhancement candidate: {candidate}")
+
+
+def _run_clearvoice_enhancement_candidate(path: Path) -> tuple[Path, str]:
+    model_name = os.getenv("CLEARVOICE_ENHANCE_MODEL", "MossFormer2_SE_48K").strip() or "MossFormer2_SE_48K"
+    output_dir = UPLOAD_DIR / f"clearvoice_enhance_{uuid.uuid4().hex[:10]}"
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    try:
+        enhancer = _get_clearvoice_enhancer(model_name)
+        enhancer(str(path), online_write=True, output_path=str(output_dir))
+    except Exception as exc:
+        raise RuntimeError(f"ClearVoice enhancement failed: {_short_error(exc)}") from exc
+
+    candidates = sorted(output_dir.rglob("*.wav"), key=lambda p: p.stat().st_mtime, reverse=True)
+    if not candidates:
+        raise RuntimeError(f"ClearVoice enhancement ({model_name}) did not produce a WAV file")
+
+    output_path = UPLOAD_DIR / f"{path.stem}_{model_name.lower()}_clearvoice.wav"
+    shutil.copyfile(candidates[0], output_path)
+    shutil.rmtree(output_dir, ignore_errors=True)
+    return output_path, f"ClearVoice {model_name} enhancement"
+
+
+def _get_clearvoice_enhancer(model_name: str) -> Any:
+    cuda_mode = os.getenv("CLEARVOICE_ENHANCE_USE_CUDA", os.getenv("CLEARVOICE_USE_CUDA", "auto")).strip().lower() or "auto"
+    cache_key = (model_name, cuda_mode)
+    with _CLEARVOICE_ENHANCER_LOCK:
+        cached = _CLEARVOICE_ENHANCER_CACHE.get(cache_key)
+        if cached is not None:
+            return cached
+        try:
+            _prepare_clearvoice_runtime()
+            clearvoice_module = importlib.import_module("clearvoice")
+            clearvoice_class = getattr(clearvoice_module, "ClearVoice")
+            cwd = Path.cwd()
+            with _clearvoice_cuda_policy(cuda_mode):
+                try:
+                    os.chdir(BACKEND_DIR)
+                    model = clearvoice_class(task="speech_enhancement", model_names=[model_name])
+                finally:
+                    os.chdir(cwd)
+        except Exception as exc:
+            raise RuntimeError(
+                "ClearVoice is not available. Install the official package in the backend Python "
+                "environment with: python -m pip install clearvoice"
+            ) from exc
+        _CLEARVOICE_ENHANCER_CACHE[cache_key] = model
+        return model
+
+
+class _clearvoice_cuda_policy:
+    def __init__(self, mode: str):
+        self.mode = mode
+        self._torch = None
+        self._mps = None
+        self._cuda_available = None
+        self._mps_available = None
+
+    def __enter__(self):
+        if self.mode not in {"0", "false", "no", "cpu"}:
+            return self
+        self._torch = importlib.import_module("torch")
+        self._mps = importlib.import_module("torch.backends.mps")
+        self._cuda_available = self._torch.cuda.is_available
+        self._mps_available = self._mps.is_available
+        self._torch.cuda.is_available = lambda: False
+        self._mps.is_available = lambda: False
+        return self
+
+    def __exit__(self, *_exc_info):
+        if self._torch is not None and self._cuda_available is not None:
+            self._torch.cuda.is_available = self._cuda_available
+        if self._mps is not None and self._mps_available is not None:
+            self._mps.is_available = self._mps_available
+        return False
+
+
+def _run_external_enhancement_candidate(path: Path, *, output_suffix: str, command_env: str, label: str) -> tuple[Path, str]:
+    command_template = os.getenv(command_env, "").strip()
+    if not command_template:
+        raise RuntimeError(f"{command_env} is not configured")
+
+    output_path = UPLOAD_DIR / f"{path.stem}_{output_suffix}.wav"
+    output_path.unlink(missing_ok=True)
+    command = command_template.format(input=str(path), output=str(output_path), output_dir=str(UPLOAD_DIR))
+    subprocess.run(command, shell=True, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+    if not output_path.exists() or output_path.stat().st_size == 0:
+        raise RuntimeError(f"{label} did not produce {output_path.name}")
+    return output_path, label
+
+
+def _candidate_metrics(attempts: list[dict], selected: str) -> dict[str, str]:
+    labels = []
+    for item in attempts:
+        score = item.get("score", -1.0)
+        score_text = f"{score:.1f}" if score >= 0 else item.get("status", "skipped")
+        labels.append(f"{item['candidate']}={score_text}")
+    return {
+        "quality_router_enhancement_candidates": "; ".join(labels),
+        "quality_router_selected_enhancement": selected,
     }
 
 
@@ -446,6 +707,16 @@ def _get_deepfilternet_backend() -> str:
     return os.getenv("DEEPFILTERNET_BACKEND", "cli").strip().lower() or "cli"
 
 
+def _get_enhancement_candidates() -> list[str]:
+    raw = os.getenv("ENHANCEMENT_CANDIDATES", "deepfilternet,clearvoice").strip()
+    candidates = [item.strip().lower() for item in raw.split(",") if item.strip()]
+    return candidates or ["deepfilternet"]
+
+
+def _quality_router_enabled() -> bool:
+    return os.getenv("QUALITY_ROUTER_ENABLED", "true").strip().lower() not in {"0", "false", "no", "off"}
+
+
 def _get_enhancement_skip_seconds() -> float:
     raw = os.getenv("ENHANCEMENT_SKIP_SECONDS", str(DEFAULT_ENHANCEMENT_SKIP_SECONDS)).strip()
     try:
@@ -476,3 +747,10 @@ def _enhancement_parallel_label_for_duration(duration: float | None) -> str:
     chunk_seconds = _get_enhancement_chunk_seconds()
     chunk_count = int((duration + chunk_seconds - 0.001) // chunk_seconds)
     return _enhancement_parallel_label(chunk_count)
+
+
+def _short_error(exc: Exception) -> str:
+    message = str(exc).strip().replace("\n", " ")
+    if len(message) > 100:
+        message = f"{message[:97]}..."
+    return f"{type(exc).__name__}: {message}" if message else type(exc).__name__

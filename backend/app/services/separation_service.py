@@ -9,10 +9,12 @@ import sys
 import uuid
 from pathlib import Path
 from typing import Any
+import threading
 
 from dotenv import load_dotenv
 
 from .audio_service import UPLOAD_DIR, audio_url, ffmpeg_executable, get_audio_duration_seconds, resolve_static_url
+from .audio_quality_service import analyze_audio_quality, score_audio_quality
 
 
 BACKEND_DIR = Path(__file__).resolve().parents[2]
@@ -25,6 +27,14 @@ DEFAULT_CHUNK_SECONDS = 60.0
 DEFAULT_MAX_CHUNKS = 120
 SPEECHBRAIN_SAVEDIR = BACKEND_DIR / "models" / "speechbrain" / "sepformer-wsj02mix"
 _SEPARATOR_CACHE: dict[tuple[str, str], Any] = {}
+_CLEARVOICE_SEPARATOR_CACHE: dict[tuple[str, str], Any] = {}
+_CLEARVOICE_SEPARATOR_LOCK = threading.Lock()
+
+
+def _prepare_clearvoice_runtime() -> None:
+    runtime_dir = BACKEND_DIR / ".runtime" / "numba_cache"
+    runtime_dir.mkdir(parents=True, exist_ok=True)
+    os.environ.setdefault("NUMBA_CACHE_DIR", str(runtime_dir))
 
 
 def separate_demo_audio(case_id: str, enhanced_audio_url: str) -> dict:
@@ -47,6 +57,41 @@ def separate_uploaded_audio(enhanced_audio_url: str) -> dict:
         output_stem=f"upload_{uuid.uuid4().hex[:8]}",
         fallback=fallback,
     )
+
+
+def separate_with_quality_router(enhanced_audio_url: str, transcript: list[dict] | None = None) -> dict:
+    if not _quality_router_enabled():
+        diarized = build_speaker_tracks_from_transcript(enhanced_audio_url, transcript or [])
+        if diarized.get("method") != "Placeholder fallback":
+            return diarized
+        return separate_uploaded_audio(enhanced_audio_url)
+
+    attempts = []
+    for candidate in _get_separation_candidates():
+        try:
+            result = _run_separation_candidate(candidate, enhanced_audio_url, transcript or [])
+            score = _score_separation_result(result)
+            result = _annotate_separation_result(result, candidate, score)
+            attempts.append({"candidate": candidate, "result": result, "score": score, "status": "ok"})
+        except Exception as exc:
+            attempts.append({"candidate": candidate, "score": -1.0, "status": f"skipped: {_short_error(exc)}"})
+
+    valid = [item for item in attempts if item.get("status") == "ok"]
+    if not valid:
+        fallback = _placeholder_upload_result(enhanced_audio_url)
+        return {
+            **_with_fallback_status(fallback, "Quality router fallback: no separation candidate succeeded"),
+            "metrics": _separation_candidate_metrics(attempts, "placeholder"),
+        }
+
+    selected = max(valid, key=lambda item: item["score"])
+    result = selected["result"]
+    result["metrics"] = {
+        **result.get("metrics", {}),
+        **_separation_candidate_metrics(attempts, selected["candidate"]),
+        "quality_router_selected_separation_score": f"{selected['score']:.1f}",
+    }
+    return result
 
 
 def build_speaker_tracks_from_transcript(enhanced_audio_url: str, transcript: list[dict]) -> dict:
@@ -108,6 +153,7 @@ def _separate_with_speechbrain(source_path: Path, output_stem: str, max_seconds:
     fetching = importlib.import_module("speechbrain.utils.fetching")
     torch = importlib.import_module("torch")
     torchaudio = importlib.import_module("torchaudio")
+    _patch_torchaudio_soundfile_io(torchaudio, torch)
 
     separator_class = getattr(speechbrain, "SepformerSeparation")
     local_strategy = getattr(getattr(fetching, "LocalStrategy"), "COPY")
@@ -204,6 +250,202 @@ def _separate_with_speechbrain_chunks(source_path: Path, output_stem: str, durat
         shutil.rmtree(work_dir, ignore_errors=True)
         for track_path in intermediate_tracks:
             track_path.unlink(missing_ok=True)
+
+
+def _run_separation_candidate(candidate: str, enhanced_audio_url: str, transcript: list[dict]) -> dict:
+    source_path = _resolve_static_url(enhanced_audio_url)
+    if candidate == "gated":
+        result = build_speaker_tracks_from_transcript(enhanced_audio_url, transcript)
+        if result.get("method") == "Placeholder fallback":
+            raise RuntimeError(result.get("status", "gated track unavailable"))
+        return result
+    if source_path is None or not source_path.exists():
+        raise RuntimeError("Enhanced audio file not found")
+    if candidate == "speechbrain":
+        duration = get_audio_duration_seconds(source_path)
+        if duration is not None and duration > _get_max_seconds():
+            return _separate_with_speechbrain_chunks(source_path, f"router_speechbrain_{uuid.uuid4().hex[:8]}", duration)
+        return _separate_with_speechbrain(source_path, f"router_speechbrain_{uuid.uuid4().hex[:8]}", max_seconds=_get_max_seconds())
+    if candidate == "mossformer2":
+        return _run_clearvoice_mossformer2_separation(source_path, output_stem=f"router_mossformer2_{uuid.uuid4().hex[:8]}")
+    raise RuntimeError(f"Unsupported separation candidate: {candidate}")
+
+
+def _run_clearvoice_mossformer2_separation(source_path: Path, output_stem: str) -> dict:
+    model_name = os.getenv("MOSSFORMER2_SEPARATION_MODEL", "MossFormer2_SS_16K").strip() or "MossFormer2_SS_16K"
+    out_dir = UPLOAD_DIR / f"{output_stem}_tracks"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        separator = _get_clearvoice_separator(model_name)
+        separator(str(source_path), online_write=True, output_path=str(out_dir))
+    except Exception as exc:
+        raise RuntimeError(f"ClearVoice/MossFormer2 separation failed: {_short_error(exc)}") from exc
+
+    candidates = sorted(out_dir.rglob("*.wav"), key=lambda p: p.name)
+    if not candidates:
+        raise RuntimeError(f"ClearVoice/MossFormer2 ({model_name}) did not produce separated WAV tracks")
+
+    tracks = []
+    for index, candidate_path in enumerate(candidates, start=1):
+        final_path = UPLOAD_DIR / f"{output_stem}_speaker_{index}.wav"
+        shutil.copyfile(candidate_path, final_path)
+        tracks.append(
+            {
+                "track_id": f"{output_stem}_speaker_{index}",
+                "label": f"MossFormer2 speaker {index}",
+                "audio_url": audio_url(final_path),
+                "description": f"ClearVoice {model_name} output track {index}.",
+            }
+        )
+    shutil.rmtree(out_dir, ignore_errors=True)
+    return {
+        "method": f"ClearVoice {model_name}",
+        "status": "ok-mossformer2",
+        "track_count": str(len(tracks)),
+        "tracks": tracks,
+    }
+
+
+def _get_clearvoice_separator(model_name: str) -> Any:
+    cuda_mode = os.getenv("MOSSFORMER2_USE_CUDA", os.getenv("CLEARVOICE_USE_CUDA", "auto")).strip().lower() or "auto"
+    cache_key = (model_name, cuda_mode)
+    with _CLEARVOICE_SEPARATOR_LOCK:
+        cached = _CLEARVOICE_SEPARATOR_CACHE.get(cache_key)
+        if cached is not None:
+            return cached
+        try:
+            _prepare_clearvoice_runtime()
+            clearvoice_module = importlib.import_module("clearvoice")
+            clearvoice_class = getattr(clearvoice_module, "ClearVoice")
+            cwd = Path.cwd()
+            with _clearvoice_cuda_policy(cuda_mode):
+                try:
+                    os.chdir(BACKEND_DIR)
+                    model = clearvoice_class(task="speech_separation", model_names=[model_name])
+                finally:
+                    os.chdir(cwd)
+        except Exception as exc:
+            raise RuntimeError(
+                "ClearVoice is not available. Install the official package in the backend Python "
+                "environment with: python -m pip install clearvoice"
+            ) from exc
+        _CLEARVOICE_SEPARATOR_CACHE[cache_key] = model
+        return model
+
+
+class _clearvoice_cuda_policy:
+    def __init__(self, mode: str):
+        self.mode = mode
+        self._torch = None
+        self._mps = None
+        self._cuda_available = None
+        self._mps_available = None
+
+    def __enter__(self):
+        if self.mode not in {"0", "false", "no", "cpu"}:
+            return self
+        self._torch = importlib.import_module("torch")
+        self._mps = importlib.import_module("torch.backends.mps")
+        self._cuda_available = self._torch.cuda.is_available
+        self._mps_available = self._mps.is_available
+        self._torch.cuda.is_available = lambda: False
+        self._mps.is_available = lambda: False
+        return self
+
+    def __exit__(self, *_exc_info):
+        if self._torch is not None and self._cuda_available is not None:
+            self._torch.cuda.is_available = self._cuda_available
+        if self._mps is not None and self._mps_available is not None:
+            self._mps.is_available = self._mps_available
+        return False
+
+
+def _run_external_separation_candidate(source_path: Path, *, output_stem: str, command_env: str, label: str) -> dict:
+    command_template = os.getenv(command_env, "").strip()
+    if not command_template:
+        raise RuntimeError(f"{command_env} is not configured")
+
+    out_dir = UPLOAD_DIR / f"{output_stem}_tracks"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    command = command_template.format(input=str(source_path), output_dir=str(out_dir), stem=output_stem)
+    subprocess.run(command, shell=True, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+    candidates = sorted(out_dir.glob("*.wav"))
+    if not candidates:
+        raise RuntimeError(f"{label} did not produce separated WAV tracks")
+
+    tracks = []
+    for index, candidate_path in enumerate(candidates, start=1):
+        final_path = UPLOAD_DIR / f"{output_stem}_speaker_{index}.wav"
+        shutil.copyfile(candidate_path, final_path)
+        tracks.append(
+            {
+                "track_id": f"{output_stem}_speaker_{index}",
+                "label": f"MossFormer2 speaker {index}",
+                "audio_url": audio_url(final_path),
+                "description": f"{label} output track {index}.",
+            }
+        )
+    return {
+        "method": label,
+        "status": "ok-mossformer2",
+        "track_count": str(len(tracks)),
+        "tracks": tracks,
+    }
+
+
+def _score_separation_result(result: dict) -> float:
+    tracks = result.get("tracks", [])
+    if not tracks:
+        return 0.0
+    score = 25.0 + min(30.0, len(tracks) * 10.0)
+    track_scores = []
+    for track in tracks:
+        path = resolve_static_url(track.get("audio_url", ""))
+        if path is not None:
+            track_scores.append(score_audio_quality(analyze_audio_quality(path)))
+    if track_scores:
+        score += sum(track_scores) / len(track_scores) * 0.35
+    status = str(result.get("status", "")).lower()
+    method = str(result.get("method", "")).lower()
+    if "placeholder" in status or "fallback" in status:
+        score -= 30
+    if "mossformer2" in method:
+        score += 8
+    if "speechbrain" in method:
+        score += 4
+    if "gated" in method:
+        score += 2
+    return max(0.0, min(100.0, score))
+
+
+def _annotate_separation_result(result: dict, candidate: str, score: float) -> dict:
+    tracks = []
+    for track in result.get("tracks", []):
+        tracks.append(
+            {
+                **track,
+                "description": (
+                    f"{track.get('description', '')} Quality-aware separation candidate={candidate}, "
+                    f"score={score:.1f}."
+                ),
+            }
+        )
+    return {
+        **result,
+        "tracks": tracks,
+    }
+
+
+def _separation_candidate_metrics(attempts: list[dict], selected: str) -> dict[str, str]:
+    labels = []
+    for item in attempts:
+        score = item.get("score", -1.0)
+        score_text = f"{score:.1f}" if score >= 0 else item.get("status", "skipped")
+        labels.append(f"{item['candidate']}={score_text}")
+    return {
+        "quality_router_separation_candidates": "; ".join(labels),
+        "quality_router_selected_separation": selected,
+    }
 
 
 def _placeholder_demo_result(case_id: str, enhanced_audio_url: str) -> dict:
@@ -356,6 +598,16 @@ def _get_max_chunks() -> int:
     return max(1, value)
 
 
+def _get_separation_candidates() -> list[str]:
+    raw = os.getenv("SEPARATION_CANDIDATES", "gated,speechbrain,mossformer2").strip()
+    candidates = [item.strip().lower() for item in raw.split(",") if item.strip()]
+    return candidates or ["gated"]
+
+
+def _quality_router_enabled() -> bool:
+    return os.getenv("QUALITY_ROUTER_ENABLED", "true").strip().lower() not in {"0", "false", "no", "off"}
+
+
 def _split_audio_to_chunks(path: Path, work_dir: Path, chunk_seconds: float, duration: float) -> list[Path]:
     ffmpeg = ffmpeg_executable()
     if not ffmpeg:
@@ -457,24 +709,31 @@ def _speaker_intervals(transcript: list[dict]) -> dict[str, list[tuple[float, fl
 
 def _write_gated_speaker_tracks(source_path: Path, intervals: dict[str, list[tuple[float, float]]]) -> list[dict]:
     soundfile = importlib.import_module("soundfile")
+    numpy = importlib.import_module("numpy")
     data, sample_rate = soundfile.read(str(source_path), always_2d=True, dtype="float32")
     if len(data) == 0 or sample_rate <= 0:
         raise RuntimeError("Source audio is empty")
 
     tracks = []
     background_gain = _get_gated_background_gain()
+    target_gain = _get_gated_target_gain()
+    limiter = _get_gated_limiter()
+    fade_samples = int(sample_rate * _get_gated_fade_ms() / 1000.0)
     for index, (speaker, speaker_intervals) in enumerate(sorted(intervals.items()), start=1):
-        output = data * background_gain
+        gains = numpy.full((len(data), 1), background_gain, dtype="float32")
         for start, end in speaker_intervals:
             start_sample = max(0, min(len(data), int(start * sample_rate)))
             end_sample = max(start_sample, min(len(data), int(end * sample_rate)))
             if end_sample > start_sample:
-                output[start_sample:end_sample, :] = data[start_sample:end_sample, :]
+                _apply_speaker_gain_window(gains, start_sample, end_sample, background_gain, target_gain, fade_samples)
+        output = numpy.clip(data * gains, -limiter, limiter)
 
         safe_label = _safe_filename(speaker)
         output_path = UPLOAD_DIR / f"{source_path.stem}_{safe_label}_diarized.wav"
         soundfile.write(str(output_path), output, sample_rate)
         speech_seconds = sum(max(0.0, end - start) for start, end in speaker_intervals)
+        background_db = _gain_to_db(background_gain)
+        target_db = _gain_to_db(target_gain)
         tracks.append(
             {
                 "track_id": f"{source_path.stem}_{safe_label}",
@@ -482,11 +741,27 @@ def _write_gated_speaker_tracks(source_path: Path, intervals: dict[str, list[tup
                 "audio_url": audio_url(output_path),
                 "description": (
                     "FunASR speaker diarization gated track: "
-                    f"保留{speaker}时间段原声，其他说话人区域低增益，讲话约{speech_seconds:.0f}s。"
+                    f"突出{speaker}时间段({target_db:+.1f} dB)，"
+                    f"其他说话人区域强衰减({background_db:.1f} dB)，讲话约{speech_seconds:.0f}s。"
                 ),
             }
         )
     return tracks
+
+
+def _apply_speaker_gain_window(gains, start: int, end: int, background_gain: float, target_gain: float, fade_samples: int) -> None:
+    gains[start:end, :] = target_gain
+    if fade_samples <= 0:
+        return
+    numpy = importlib.import_module("numpy")
+    segment_len = max(0, end - start)
+    fade_len = min(fade_samples, max(1, segment_len // 2))
+    if fade_len <= 1:
+        return
+    fade_in = numpy.linspace(background_gain, target_gain, fade_len, dtype="float32").reshape(-1, 1)
+    fade_out = numpy.linspace(target_gain, background_gain, fade_len, dtype="float32").reshape(-1, 1)
+    gains[start : start + fade_len, :] = fade_in
+    gains[end - fade_len : end, :] = fade_out
 
 
 def _parse_timestamp(value: Any) -> float:
@@ -530,12 +805,45 @@ def _safe_filename(value: str) -> str:
 
 
 def _get_gated_background_gain() -> float:
-    raw = os.getenv("SPEAKER_TRACK_BACKGROUND_GAIN", "0.05").strip()
+    raw = os.getenv("SPEAKER_TRACK_BACKGROUND_GAIN", "0.015").strip()
     try:
         value = float(raw)
     except ValueError:
-        return 0.05
+        return 0.015
     return min(0.5, max(0.0, value))
+
+
+def _get_gated_target_gain() -> float:
+    raw = os.getenv("SPEAKER_TRACK_TARGET_GAIN", "1.25").strip()
+    try:
+        value = float(raw)
+    except ValueError:
+        return 1.25
+    return min(2.0, max(0.1, value))
+
+
+def _get_gated_fade_ms() -> float:
+    raw = os.getenv("SPEAKER_TRACK_FADE_MS", "25").strip()
+    try:
+        value = float(raw)
+    except ValueError:
+        return 25.0
+    return min(250.0, max(0.0, value))
+
+
+def _get_gated_limiter() -> float:
+    raw = os.getenv("SPEAKER_TRACK_LIMIT", "0.98").strip()
+    try:
+        value = float(raw)
+    except ValueError:
+        return 0.98
+    return min(1.0, max(0.1, value))
+
+
+def _gain_to_db(gain: float) -> float:
+    if gain <= 0:
+        return -120.0
+    return 20.0 * math.log10(gain)
 
 
 def _trim_sources(sources: Any, max_seconds: float) -> Any:
@@ -589,6 +897,48 @@ def _save_speaker_audio(torchaudio: Any, speaker_audio: Any, output_path: Path, 
     soundfile = importlib.import_module("soundfile")
     waveform = speaker_audio.squeeze(0).detach().cpu().numpy()
     soundfile.write(str(output_path), waveform, sample_rate)
+
+
+def _patch_torchaudio_soundfile_io(torchaudio: Any, torch: Any) -> None:
+    try:
+        if not hasattr(torchaudio, "load"):
+            return
+        soundfile = importlib.import_module("soundfile")
+        from types import SimpleNamespace
+
+        def info(path: str, **_kwargs):
+            metadata = soundfile.info(path)
+            return SimpleNamespace(
+                sample_rate=metadata.samplerate,
+                num_frames=metadata.frames,
+                num_channels=metadata.channels,
+                bits_per_sample=0,
+                encoding=str(metadata.subtype or ""),
+            )
+
+        def load(path: str, frame_offset: int = 0, num_frames: int = -1, channels_first: bool = True, **_kwargs):
+            stop = None if num_frames is None or num_frames < 0 else frame_offset + num_frames
+            data, sample_rate = soundfile.read(
+                path,
+                start=max(0, frame_offset),
+                stop=stop,
+                always_2d=True,
+                dtype="float32",
+            )
+            tensor = torch.from_numpy(data.T.copy() if channels_first else data.copy())
+            return tensor, sample_rate
+
+        def save(path: str, tensor, sample_rate: int, **_kwargs):
+            audio = tensor.detach().cpu().numpy() if hasattr(tensor, "detach") else tensor
+            if getattr(audio, "ndim", 0) == 2 and audio.shape[0] <= audio.shape[1]:
+                audio = audio.T
+            soundfile.write(path, audio, sample_rate)
+
+        torchaudio.info = info
+        torchaudio.load = load
+        torchaudio.save = save
+    except Exception:
+        return
 
 
 def _time_dimension(shape: tuple[int, ...]) -> int:

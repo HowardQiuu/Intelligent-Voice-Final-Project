@@ -4,3 +4,7 @@
 # Use the CPU index only on machines without a CUDA-capable GPU.
 speechbrain
 soundfile
+# ClearerVoice-Studio / MossFormer2 integration is command-adapter based.
+# Install that project separately on GPU machines and set:
+#   CLEARVOICE_ENHANCE_COMMAND
+#   MOSSFORMER2_SEPARATION_COMMAND

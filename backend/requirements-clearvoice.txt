@@ -1,0 +1,6 @@
+# Optional ClearVoice FRCRN/MossFormer2 backend.
+# Install in the Python 3.11 voice environment, then keep/restore CUDA PyTorch:
+#   python -m pip install clearvoice
+#   python -m pip install --force-reinstall torch==2.11.0 torchaudio==2.11.0 --index-url https://download.pytorch.org/whl/cu128
+#   python -m pip install --force-reinstall torchvision==0.26.0 --no-deps --index-url https://download.pytorch.org/whl/cu128
+clearvoice

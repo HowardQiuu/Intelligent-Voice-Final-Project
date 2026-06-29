@@ -19,6 +19,7 @@ from app.services.audio_service import UPLOAD_DIR  # noqa: E402
 class EnhancementServiceTest(unittest.TestCase):
     def setUp(self) -> None:
         enhancement_service._DEEPFILTER_SOURCE_CACHE.clear()
+        enhancement_service._CLEARVOICE_ENHANCER_CACHE.clear()
         self.env_patch = patch.dict(os.environ, {}, clear=True)
         self.env_patch.start()
 
@@ -37,7 +38,7 @@ class EnhancementServiceTest(unittest.TestCase):
             wav.writeframes(b"\0\0" * 8000 * 120)
 
         try:
-            with patch.dict(os.environ, {"ENHANCEMENT_MAX_SECONDS": "60"}, clear=True):
+            with patch.dict(os.environ, {"ENHANCEMENT_MAX_SECONDS": "60", "ENHANCEMENT_CANDIDATES": "deepfilternet"}, clear=True):
                 with patch(
                     "app.services.enhancement_service.denoise_audio_in_chunks",
                     return_value=(enhanced, "DeepFilterNet chunked denoise (2 chunks x 60s)"),
@@ -69,15 +70,20 @@ class EnhancementServiceTest(unittest.TestCase):
             wav.writeframes(b"\0\0" * 8000)
 
         try:
-            with patch(
-                "app.services.enhancement_service.denoise_audio",
-                return_value=(enhanced, "DeepFilterNet denoise"),
-            ) as denoise_mock:
+            with patch.dict(os.environ, {"ENHANCEMENT_CANDIDATES": "deepfilternet"}, clear=True):
                 with patch(
-                    "app.services.enhancement_service.postprocess_enhanced_audio",
-                    return_value=(loudness, "ok"),
-                ) as postprocess_mock:
-                    result = enhancement_service.enhance_uploaded_audio(path)
+                    "app.services.enhancement_service.apply_audibility_pregain",
+                    return_value=(path, "skipped", {"quality_pregain_status": "skipped"}),
+                ):
+                    with patch(
+                        "app.services.enhancement_service.denoise_audio",
+                        return_value=(enhanced, "DeepFilterNet denoise"),
+                    ) as denoise_mock:
+                        with patch(
+                            "app.services.enhancement_service.postprocess_enhanced_audio",
+                            return_value=(loudness, "ok"),
+                        ) as postprocess_mock:
+                            result = enhancement_service.enhance_uploaded_audio(path)
         finally:
             path.unlink(missing_ok=True)
 
@@ -253,6 +259,80 @@ class EnhancementServiceTest(unittest.TestCase):
                 model_dir.rmdir()
 
         self.assertEqual(fake_enhance_module.init_calls, 2)
+
+    def test_quality_router_skips_unconfigured_candidate_and_selects_deepfilternet(self) -> None:
+        source = UPLOAD_DIR / "router_source.wav"
+        enhanced = UPLOAD_DIR / "router_source_deepfilter.wav"
+        loudness = UPLOAD_DIR / "router_source_deepfilter_loudness.wav"
+        source.write_bytes(b"wav")
+        enhanced.write_bytes(b"enhanced")
+        loudness.write_bytes(b"loud")
+
+        try:
+            with patch.dict(
+                os.environ,
+                {"ENHANCEMENT_CANDIDATES": "clearvoice,deepfilternet", "QUALITY_ROUTER_ENABLED": "true"},
+                clear=True,
+            ):
+                with patch(
+                    "app.services.enhancement_service.apply_audibility_pregain",
+                    return_value=(source, "skipped", {"quality_pregain_status": "skipped"}),
+                ):
+                    with patch(
+                        "app.services.enhancement_service._run_clearvoice_enhancement_candidate",
+                        side_effect=RuntimeError("not installed"),
+                    ):
+                        with patch(
+                            "app.services.enhancement_service.denoise_audio",
+                            return_value=(enhanced, "DeepFilterNet denoise"),
+                        ):
+                            with patch(
+                                "app.services.enhancement_service.postprocess_enhanced_audio",
+                                return_value=(loudness, "ok"),
+                            ):
+                                result = enhancement_service.enhance_uploaded_audio(source)
+        finally:
+            for path in [source, enhanced, loudness]:
+                path.unlink(missing_ok=True)
+
+        self.assertEqual(result["enhanced_audio_url"], "/static/uploads/router_source_deepfilter_loudness.wav")
+        self.assertEqual(result["metrics"]["quality_router_selected_enhancement"], "deepfilternet")
+        self.assertIn("clearvoice=skipped", result["metrics"]["quality_router_enhancement_candidates"])
+
+    def test_clearvoice_candidate_uses_native_api_output(self) -> None:
+        source = UPLOAD_DIR / "clearvoice_native_input.wav"
+        produced_dir = UPLOAD_DIR / "clearvoice_fake_model"
+        output_path = UPLOAD_DIR / "clearvoice_native_input_mossformer2_se_48k_clearvoice.wav"
+        source.write_bytes(b"wav")
+
+        class FakeClearVoice:
+            def __init__(self, task, model_names):
+                self.task = task
+                self.model_names = model_names
+
+            def __call__(self, input_path, online_write=False, output_path=None):
+                produced = Path(output_path) / "MossFormer2_SE_48K" / "clearvoice_native_input.wav"
+                produced.parent.mkdir(parents=True, exist_ok=True)
+                produced.write_bytes(b"enhanced")
+
+        fake_module = SimpleNamespace(ClearVoice=FakeClearVoice)
+        try:
+            with patch.object(enhancement_service.importlib, "import_module", return_value=fake_module):
+                output_path, method = enhancement_service._run_clearvoice_enhancement_candidate(source)
+        finally:
+            source.unlink(missing_ok=True)
+            output_path.unlink(missing_ok=True)
+            if produced_dir.exists():
+                for child in produced_dir.rglob("*"):
+                    if child.is_file():
+                        child.unlink()
+                for child in sorted(produced_dir.rglob("*"), reverse=True):
+                    if child.is_dir():
+                        child.rmdir()
+                produced_dir.rmdir()
+
+        self.assertTrue(output_path.name.endswith("_mossformer2_se_48k_clearvoice.wav"))
+        self.assertIn("ClearVoice MossFormer2_SE_48K", method)
 
 class _FakeAudio:
     def to(self, _device: str):

@@ -2,8 +2,38 @@
 
 这是一个面向智能语音课程结课展示的 Web Demo，用于演示从会议音频到结构化会议纪要的完整链路：
 
-```text
-会议音频输入 -> 语音增强 -> 分块处理 -> 语音分离 -> 自动语音识别 -> 摘要生成 -> 会议纪要输出
+## 整体流程图
+
+```mermaid
+flowchart TD
+    A["会议音频输入<br/>浏览器上传 / 分块上传 / 本地路径"] --> B["音频归一化<br/>audio_service.py<br/>采样率转换 / mono 下混 / loudnorm"]
+    B --> C["语音增强<br/>enhancement_service.py<br/>DeepFilterNet 优先<br/>失败时 loudnorm + limiter 兜底"]
+    C --> D["长音频分块<br/>chunking_service.py<br/>默认 60s 窗口 + 5s overlap"]
+    D --> E{"ASR 路由<br/>asr_service.py<br/>ASR_BACKEND"}
+
+    E -->|"默认主路径"| F["中文会议转写<br/>funasr_service.py<br/>SenseVoiceSmall"]
+    F --> G["VAD 分段<br/>fsmn-vad"]
+    G --> H["说话人分段<br/>CAM++<br/>spk_mode=vad_segment"]
+    H --> I["说话人转写<br/>说话人 A/B/C + 时间戳"]
+
+    E -->|"FunASR 不可用"| J["ASR 回退<br/>faster-whisper<br/>small/base 等模型"]
+    J --> I
+    E -->|"模型不可用/演示模式"| K["演示兜底转写<br/>保证页面不白屏"]
+    K --> I
+
+    I --> L["说话人轨道生成<br/>separation_service.py<br/>FunASR diarization gated track"]
+    L -.可选实验.-> M["真波形分离<br/>SpeechBrain SepFormer<br/>预留 ClearVoice/MossFormer2 扩展"]
+
+    I --> N["主题分组<br/>transcript_topic_service.py<br/>LLM API / 本地兜底"]
+    I --> O["会议纪要<br/>summary_service.py<br/>DeepSeek/OpenAI-compatible API<br/>失败时本地抽取式摘要"]
+    C --> P["增强可视化<br/>visualization_service.py<br/>波形/噪声底/清晰度对比"]
+    I --> Q["质量评分与诊断<br/>pipeline_analysis_service.py<br/>覆盖率/重叠比例/说话人画像/路由说明"]
+
+    L --> R["前端展示<br/>AudioCompare.jsx<br/>说话人轨道播放"]
+    N --> S["前端展示<br/>Transcript.jsx<br/>主题块转写"]
+    O --> T["前端展示<br/>Summary.jsx<br/>摘要/决策/待办"]
+    P --> U["前端展示<br/>增强可视化"]
+    Q --> V["前端展示<br/>ProcessingDiagnostics.jsx<br/>自适应策略 + 会议质量"]
 ```
 
 项目当前目标是“稳定可演示 + 接口可替换”。完整会议提取主流程现在优先采用中文会议路线：DeepFilterNet 增强后调用 FunASR/SenseVoice + VAD + CAM++ 生成带说话人标签的中文转写，再根据说话人时间段生成可试听轨道和质量评分。SpeechBrain SepFormer 保留为独立实验分离后端；faster-whisper 保留为 FunASR 不可用时的 ASR 回退。
@@ -392,6 +422,7 @@ npm.cmd run build
 3. 展示分块处理计划，说明长会议音频如何避免内存爆掉。
 4. 展示说话人轨道，说明完整 pipeline 优先使用 FunASR/SenseVoice + VAD + CAM++；SpeechBrain SepFormer 是可选实验后端。
 5. 展示结构化会议纪要：主题、关键词、摘要、关键决策、待办事项。
+
 # 中文会议 Pipeline 升级说明
 
 新的默认设计面向中文课堂/会议展示：

@@ -13,7 +13,7 @@ sys.path.insert(0, str(BACKEND_DIR))
 
 from app.services.audio_service import UPLOAD_DIR  # noqa: E402
 from app.services.chunking_service import build_chunk_plan  # noqa: E402
-from app.services.visualization_service import generate_enhancement_visual  # noqa: E402
+from app.services.visualization_service import generate_enhancement_visual, _level_matched_comparison  # noqa: E402
 
 
 class ChunkingVisualizationTest(unittest.TestCase):
@@ -52,6 +52,27 @@ class ChunkingVisualizationTest(unittest.TestCase):
             enhanced.unlink(missing_ok=True)
             if url:
                 (UPLOAD_DIR / Path(url).name).unlink(missing_ok=True)
+
+    def test_level_matched_visual_diagnosis_marks_gain_only_as_mixed(self) -> None:
+        original = {
+            "avg_rms": 0.041,
+            "noise_floor": 0.023,
+            "speech_rms": 0.060,
+            "clarity_db": 8.3,
+        }
+        enhanced = {
+            "avg_rms": 0.099,
+            "noise_floor": 0.065,
+            "speech_rms": 0.136,
+            "clarity_db": 6.4,
+        }
+
+        matched = _level_matched_comparison(original, enhanced)
+
+        self.assertEqual(matched["verdict_level"], "mixed")
+        self.assertIn("可听度提升", matched["verdict"])
+        self.assertLess(abs(matched["energy_change_percent"]), 200)
+        self.assertEqual(matched["matched_noise_change"], "+17.0%")
 
 
 def _write_wav(name: str, seconds: int, amplitude: int = 1000) -> Path:

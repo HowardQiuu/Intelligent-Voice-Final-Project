@@ -8,11 +8,12 @@ const GROUPS = [
     match: (key) =>
       key.includes("主处理后端") ||
       key.includes("中文ASR模型") ||
-      key.includes("自适应路由") ||
+      key.includes("自适应路径") ||
       key.includes("会议提取质量评分") ||
       key.includes("语音覆盖率") ||
       key.includes("疑似重叠比例") ||
-      key.includes("静音比例"),
+      key.includes("静音比例") ||
+      key.includes("quality_router"),
   },
   {
     title: "说话人画像",
@@ -37,12 +38,17 @@ const GROUPS = [
       key.includes("噪声") ||
       key.includes("清晰度") ||
       key.includes("能量") ||
-      key.includes("峰值"),
+      key.includes("峰值") ||
+      key.includes("pregain") ||
+      key.includes("enhancement_selected"),
   },
   {
     title: "语音分离",
     icon: Settings2,
-    match: (key) => key.includes("分离"),
+    match: (key) =>
+      key.includes("分离") ||
+      key.includes("separation_candidates") ||
+      key.includes("selected_separation"),
   },
   {
     title: "摘要生成",
@@ -61,6 +67,28 @@ const METRIC_LABELS = {
   runtime_summary_seconds: "后端摘要生成耗时",
   runtime_topic_seconds: "后端主题分类耗时",
   runtime_total_seconds: "后端处理总耗时",
+  quality_router_status: "Quality Router",
+  quality_router_enhancement_candidates: "增强候选评分",
+  quality_router_selected_enhancement: "选中增强候选",
+  quality_router_selected_score: "选中增强评分",
+  quality_router_separation_candidates: "分离候选评分",
+  quality_router_selected_separation: "选中分离候选",
+  quality_router_selected_separation_score: "选中分离评分",
+  quality_pregain_status: "预增益状态",
+  quality_pregain_gain_db: "预增益增益",
+  pregain_input_rms_dbfs: "预增益前 RMS(dBFS)",
+  pregain_output_rms_dbfs: "预增益后 RMS(dBFS)",
+  pregain_input_peak_dbfs: "预增益前 Peak(dBFS)",
+  pregain_output_peak_dbfs: "预增益后 Peak(dBFS)",
+  pregain_input_silent_ratio: "预增益前静音比例",
+  pregain_output_silent_ratio: "预增益后静音比例",
+  pregain_input_clipping_ratio: "预增益前削波比例",
+  pregain_output_clipping_ratio: "预增益后削波比例",
+  enhancement_selected_rms_dbfs: "最终增强 RMS(dBFS)",
+  enhancement_selected_peak_dbfs: "最终增强 Peak(dBFS)",
+  enhancement_selected_silent_ratio: "最终增强静音比例",
+  enhancement_selected_clipping_ratio: "最终增强削波比例",
+  enhancement_selected_spectral_centroid_hz: "最终增强频谱质心",
 };
 
 export function ProcessingDiagnostics({ metrics = {} }) {

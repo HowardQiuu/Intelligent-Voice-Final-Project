@@ -16,7 +16,7 @@ from .chunking_service import build_chunk_plan
 from .demo_cache import get_case, get_result
 from .enhancement_service import enhance_demo_audio, enhance_uploaded_audio
 from .pipeline_analysis_service import build_meeting_analysis_metrics
-from .separation_service import build_speaker_tracks_from_transcript, separate_uploaded_audio
+from .separation_service import separate_uploaded_audio, separate_with_quality_router
 from .summary_service import fallback_summary, generate_summary
 from .transcript_topic_service import classify_transcript_topics
 from .visualization_service import generate_enhancement_visual
@@ -53,7 +53,7 @@ def process_demo_case(case_id: str) -> ProcessResult:
         fallback=cached["summary"],
     )
     topic_result = classify_transcript_topics(cached["transcript"], case["name"])
-    separation = build_speaker_tracks_from_transcript(audio["enhanced_audio_url"], cached["transcript"])
+    separation = separate_with_quality_router(audio["enhanced_audio_url"], cached["transcript"])
     analysis_metrics = build_meeting_analysis_metrics(
         audio_path=enhanced_path,
         transcript=cached["transcript"],
@@ -71,6 +71,7 @@ def process_demo_case(case_id: str) -> ProcessResult:
         **topic_result.metrics,
         **summary_result.metrics,
         **analysis_metrics,
+        **separation.get("metrics", {}),
     }
     return ProcessResult(
         case_id=case_id,
@@ -145,9 +146,7 @@ def process_audio_path(raw_path: Path, display_name: str, case_id: str) -> Proce
     timings["runtime_asr_seconds"] = time.perf_counter() - stage_start
 
     stage_start = time.perf_counter()
-    separation = build_speaker_tracks_from_transcript(audio["enhanced_audio_url"], asr_result["transcript"])
-    if separation.get("method") == "Placeholder fallback":
-        separation = separate_uploaded_audio(audio["enhanced_audio_url"])
+    separation = separate_with_quality_router(audio["enhanced_audio_url"], asr_result["transcript"])
     timings["runtime_separation_seconds"] = time.perf_counter() - stage_start
 
     analysis_metrics = build_meeting_analysis_metrics(
@@ -167,6 +166,7 @@ def process_audio_path(raw_path: Path, display_name: str, case_id: str) -> Proce
         **audio.get("metrics", {}),
         **visual_metrics,
         **analysis_metrics,
+        **separation.get("metrics", {}),
     }
     stage_start = time.perf_counter()
     summary_result = generate_summary(

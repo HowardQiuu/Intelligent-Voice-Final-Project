@@ -4,6 +4,8 @@ backend/.env
 backend/.venv/
 backend/.runtime/
 backend/models/
+backend/checkpoints/
+checkpoints/
 backend/app/static/uploads/*
 !backend/app/static/uploads/.gitkeep
 __pycache__/
