@@ -146,7 +146,8 @@ def process_audio_path(raw_path: Path, display_name: str, case_id: str) -> Proce
     timings["runtime_asr_seconds"] = time.perf_counter() - stage_start
 
     stage_start = time.perf_counter()
-    separation = separate_with_quality_router(audio["enhanced_audio_url"], asr_result["transcript"])
+    separation_audio_url, separation_input_source = _select_separation_audio_url(audio, normalized, raw_path=raw_path)
+    separation = separate_with_quality_router(separation_audio_url, asr_result["transcript"])
     timings["runtime_separation_seconds"] = time.perf_counter() - stage_start
 
     analysis_metrics = build_meeting_analysis_metrics(
@@ -163,6 +164,7 @@ def process_audio_path(raw_path: Path, display_name: str, case_id: str) -> Proce
         "分离轨道数": separation["track_count"],
         "分块处理": chunk_plan["summary"],
         "分块数量": chunk_plan["chunk_count"],
+        "separation_input_source": separation_input_source,
         **audio.get("metrics", {}),
         **visual_metrics,
         **analysis_metrics,
@@ -207,6 +209,23 @@ def process_audio_path(raw_path: Path, display_name: str, case_id: str) -> Proce
 
 def separate_uploaded_path(raw_path: Path, display_name: str) -> dict:
     normalized = normalize_upload(raw_path, raw_path.stem)
+    if _skip_separate_upload_enhancement():
+        audio = {
+            "original_audio_url": audio_url(normalized),
+            "enhanced_audio_url": audio_url(normalized),
+            "metrics": _fallback_loudness_metrics(),
+            "method": "separate-upload enhancement skipped",
+        }
+        separation_audio_url, separation_input_source = _select_separation_audio_url(audio, normalized, raw_path=raw_path)
+        separation = separate_uploaded_audio(separation_audio_url)
+        return {
+            "file_name": display_name,
+            "original_audio_url": audio["original_audio_url"],
+            "enhanced_audio_url": audio["enhanced_audio_url"],
+            "separation_input_source": separation_input_source,
+            "enhancement_method": audio["method"],
+            "separation": separation,
+        }
     try:
         audio = enhance_uploaded_audio(normalized)
     except RuntimeError as exc:
@@ -216,14 +235,30 @@ def separate_uploaded_path(raw_path: Path, display_name: str) -> dict:
             "metrics": _fallback_loudness_metrics(),
             "method": f"上传增强兜底：{_compact_error(exc)}",
         }
-    separation = separate_uploaded_audio(audio["enhanced_audio_url"])
+    separation_audio_url, separation_input_source = _select_separation_audio_url(audio, normalized, raw_path=raw_path)
+    separation = separate_uploaded_audio(separation_audio_url)
     return {
         "file_name": display_name,
         "original_audio_url": audio["original_audio_url"],
         "enhanced_audio_url": audio["enhanced_audio_url"],
+        "separation_input_source": separation_input_source,
         "enhancement_method": audio["method"],
         "separation": separation,
     }
+
+
+def _skip_separate_upload_enhancement() -> bool:
+    return os.getenv("SEPARATE_UPLOAD_SKIP_ENHANCEMENT", "false").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _select_separation_audio_url(audio: dict, normalized_path: Path, raw_path: Path | None = None) -> tuple[str, str]:
+    default_source = "raw" if raw_path is not None else "normalized"
+    source = os.getenv("SEPARATION_INPUT_SOURCE", default_source).strip().lower() or default_source
+    if source in {"enhanced", "enhanced_audio", "denoised"}:
+        return audio["enhanced_audio_url"], "enhanced"
+    if source in {"raw", "original", "mix"} and raw_path is not None and raw_path.exists():
+        return audio_url(stage_local_file(raw_path)), "raw"
+    return audio_url(normalized_path), "normalized"
 
 
 def _fallback_loudness_metrics() -> dict[str, str]:

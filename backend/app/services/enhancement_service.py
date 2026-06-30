@@ -447,13 +447,6 @@ def _run_enhancement_candidate(candidate: str, path: Path, duration: float | Non
         return _run_deepfilternet_candidate(path, duration)
     if candidate == "clearvoice":
         return _run_clearvoice_enhancement_candidate(path)
-    if candidate == "voicefixer":
-        return _run_external_enhancement_candidate(
-            path,
-            output_suffix="voicefixer",
-            command_env="VOICEFIXER_ENHANCE_COMMAND",
-            label="VoiceFixer restoration",
-        )
     raise RuntimeError(f"Unsupported enhancement candidate: {candidate}")
 
 
@@ -530,20 +523,6 @@ class _clearvoice_cuda_policy:
         if self._mps is not None and self._mps_available is not None:
             self._mps.is_available = self._mps_available
         return False
-
-
-def _run_external_enhancement_candidate(path: Path, *, output_suffix: str, command_env: str, label: str) -> tuple[Path, str]:
-    command_template = os.getenv(command_env, "").strip()
-    if not command_template:
-        raise RuntimeError(f"{command_env} is not configured")
-
-    output_path = UPLOAD_DIR / f"{path.stem}_{output_suffix}.wav"
-    output_path.unlink(missing_ok=True)
-    command = command_template.format(input=str(path), output=str(output_path), output_dir=str(UPLOAD_DIR))
-    subprocess.run(command, shell=True, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
-    if not output_path.exists() or output_path.stat().st_size == 0:
-        raise RuntimeError(f"{label} did not produce {output_path.name}")
-    return output_path, label
 
 
 def _candidate_metrics(attempts: list[dict], selected: str) -> dict[str, str]:

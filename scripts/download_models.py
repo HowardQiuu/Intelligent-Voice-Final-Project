@@ -23,7 +23,7 @@ def main() -> int:
     parser.add_argument("--asr-model", default=os.getenv("ASR_MODEL", "small"), help="faster-whisper model name.")
     parser.add_argument(
         "--separation-model",
-        default=os.getenv("SEPARATION_MODEL", "speechbrain/sepformer-wsj02mix"),
+        default=os.getenv("SEPARATION_MODEL", "speechbrain/sepformer-libri2mix"),
         help="SpeechBrain model name.",
     )
     args = parser.parse_args()

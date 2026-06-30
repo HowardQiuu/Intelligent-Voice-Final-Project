@@ -162,15 +162,22 @@ def _quality_score(
 def _route_explanation(asr_metrics: dict[str, str], separation: dict, overlap_ratio: float) -> str:
     backend = asr_metrics.get("ASR 后端") or asr_metrics.get("ASR 鍚庣") or "fallback"
     separation_status = separation.get("status", "unknown")
+    separation_method = str(separation.get("method", "")).lower()
     if backend == "funasr":
         base = "中文会议主路径：DeepFilterNet增强后使用FunASR/SenseVoice+VAD+CAM++完成转写和说话人分段"
     elif backend == "faster-whisper":
         base = "FunASR不可用时自动回退到faster-whisper，保证演示链路不中断"
     else:
         base = "真实ASR不可用时使用演示兜底，保证页面和摘要流程稳定"
+    if "speechbrain" in separation_method or "mossformer2" in separation_method or "clearvoice" in separation_method:
+        separation_note = "当前使用真实盲源分离候选输出多轨音频"
+    elif "gated" in separation_method:
+        separation_note = "当前使用说话人分段门控轨道，用于试听而非硬盲源分离"
+    else:
+        separation_note = "当前分离输出由质量路由或兜底策略决定"
     if overlap_ratio >= 0.08:
-        return f"{base}；检测到较高重叠，短片段可启用ClearVoice/MossFormer2实验分离；当前分离状态：{separation_status}"
-    return f"{base}；当前以说话人分段轨道替代盲源硬分离；分离状态：{separation_status}"
+        return f"{base}；检测到较高重叠，{separation_note}；分离状态：{separation_status}"
+    return f"{base}；{separation_note}；分离状态：{separation_status}"
 
 
 def _speaker_profile_text(stats: dict[str, dict[str, float]], duration: float | None) -> str:

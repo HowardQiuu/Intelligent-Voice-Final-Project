@@ -1,64 +1,45 @@
-# 智能会议语音分离与转写系统 Demo
+# Intelligent Voice Final Project
 
-这是一个面向智能语音课程结课展示的 Web Demo，用于演示从会议音频到结构化会议纪要的完整链路：
+这是一个面向中文会议场景的智能语音处理 Demo。当前交付版已经收敛为最小稳定流程：语音增强、语音分离、ASR 转写、会议摘要四个模块，加上必要的兜底路径，避免保留探究阶段的实验入口和评测缓存。
 
-## 整体流程图
+## 最终主流程
 
-```mermaid
-flowchart TD
-    A["会议音频输入<br/>浏览器上传 / 分块上传 / 本地路径"] --> B["音频归一化<br/>audio_service.py<br/>采样率转换 / mono 下混 / loudnorm"]
-    B --> C["语音增强<br/>enhancement_service.py<br/>DeepFilterNet 优先<br/>失败时 loudnorm + limiter 兜底"]
-    C --> D["长音频分块<br/>chunking_service.py<br/>默认 60s 窗口 + 5s overlap"]
-    D --> E{"ASR 路由<br/>asr_service.py<br/>ASR_BACKEND"}
-
-    E -->|"默认主路径"| F["中文会议转写<br/>funasr_service.py<br/>SenseVoiceSmall"]
-    F --> G["VAD 分段<br/>fsmn-vad"]
-    G --> H["说话人分段<br/>CAM++<br/>spk_mode=vad_segment"]
-    H --> I["说话人转写<br/>说话人 A/B/C + 时间戳"]
-
-    E -->|"FunASR 不可用"| J["ASR 回退<br/>faster-whisper<br/>small/base 等模型"]
-    J --> I
-    E -->|"模型不可用/演示模式"| K["演示兜底转写<br/>保证页面不白屏"]
-    K --> I
-
-    I --> L["说话人轨道生成<br/>separation_service.py<br/>FunASR diarization gated track"]
-    L -.可选实验.-> M["真波形分离<br/>SpeechBrain SepFormer<br/>预留 ClearVoice/MossFormer2 扩展"]
-
-    I --> N["主题分组<br/>transcript_topic_service.py<br/>LLM API / 本地兜底"]
-    I --> O["会议纪要<br/>summary_service.py<br/>DeepSeek/OpenAI-compatible API<br/>失败时本地抽取式摘要"]
-    C --> P["增强可视化<br/>visualization_service.py<br/>波形/噪声底/清晰度对比"]
-    I --> Q["质量评分与诊断<br/>pipeline_analysis_service.py<br/>覆盖率/重叠比例/说话人画像/路由说明"]
-
-    L --> R["前端展示<br/>AudioCompare.jsx<br/>说话人轨道播放"]
-    N --> S["前端展示<br/>Transcript.jsx<br/>主题块转写"]
-    O --> T["前端展示<br/>Summary.jsx<br/>摘要/决策/待办"]
-    P --> U["前端展示<br/>增强可视化"]
-    Q --> V["前端展示<br/>ProcessingDiagnostics.jsx<br/>自适应策略 + 会议质量"]
+```text
+会议音频上传
+-> 音频标准化
+-> 语音增强
+-> 最佳分离路径：Libri2Mix SepFormer / ClearVoice MossFormer2 质量路由
+-> 兜底路径：FunASR 说话人分段门控轨道 / placeholder 轨道
+-> ASR 转写
+-> 主题整理与会议摘要
+-> 前端试听、转写和摘要展示
 ```
 
-项目当前目标是“稳定可演示 + 接口可替换”。完整会议提取主流程现在优先采用中文会议路线：DeepFilterNet 增强后调用 FunASR/SenseVoice + VAD + CAM++ 生成带说话人标签的中文转写，再根据说话人时间段生成可试听轨道和质量评分。SpeechBrain SepFormer 保留为独立实验分离后端；faster-whisper 保留为 FunASR 不可用时的 ASR 回退。
+当前最佳分离配置：
 
-## 一键安装并启动
-
-首次运行根据系统选择：
-
-```bash
-# macOS / Linux / Git Bash
-bash install.sh
+```text
+QUALITY_ROUTER_ENABLED=true
+SEPARATION_INPUT_SOURCE=raw
+SEPARATION_CANDIDATES=libri2mix,mossformer2,gated
+SEPARATION_MODEL=speechbrain/sepformer-libri2mix
+MOSSFORMER2_SEPARATION_MODEL=MossFormer2_SS_16K
 ```
+
+其中 `libri2mix` 和 `mossformer2` 是最终保留的真实盲源分离候选；`gated` 和 `placeholder` 是兜底展示路径，保证模型不可用或输入不适合分离时页面仍能返回可试听轨道。
+
+## 启动方式
+
+Windows：
 
 ```powershell
-# Windows PowerShell / CMD
-.\install_project.cmd
+.\start_project.cmd
 ```
 
-脚本会自动完成：
+macOS / Linux / Git Bash：
 
-- 创建 `backend/.venv` Python 虚拟环境
-- 安装后端基础依赖 `backend/requirements.txt`
-- 安装前端依赖 `frontend/package-lock.json`
-- 清理旧的 `8000` / `5173` 监听进程
-- 启动 FastAPI 后端和 Vite 前端
+```bash
+bash install.sh
+```
 
 启动后打开：
 
@@ -66,56 +47,11 @@ bash install.sh
 http://127.0.0.1:5173
 ```
 
-默认安装的是稳定演示所需的基础环境。真实 ASR、语音分离、DeepFilterNet 降噪依赖体积较大，可按需安装：
-
-```bash
-bash install.sh --with-asr
-bash install.sh --with-separation
-bash install.sh --with-deepfilter
-bash install.sh --full
-bash install.sh --full --download-models
-```
-
-Windows 下对应命令为：
-
-```powershell
-.\install_project.cmd --with-asr
-.\install_project.cmd --with-separation
-.\install_project.cmd --with-deepfilter
-.\install_project.cmd --full
-.\install_project.cmd --full --download-models
-```
-
-只安装依赖、不启动服务：
-
-```bash
-bash install.sh --no-start
-```
-
-```powershell
-.\install_project.cmd --no-start
-```
-
-`install.sh` 启动后按 `Ctrl+C` 可停止本次启动的前后端服务；后端日志在 `.runtime/backend.log`。Windows 脚本会复用下面的 `start_project.cmd`，停止服务可运行 `.\stop_project.cmd`。
-
-多人协作时，推荐先阅读：
+后端接口：
 
 ```text
-docs/TEAM_SETUP.md
+http://127.0.0.1:8000
 ```
-
-## Windows 一键启动
-
-在项目根目录运行：
-
-```powershell
-.\start_project.cmd
-```
-
-脚本会自动清理旧的 `8000` / `5173` 监听进程，然后启动：
-
-- FastAPI 后端：`http://127.0.0.1:8000`
-- Vite 前端：`http://127.0.0.1:5173`
 
 停止服务：
 
@@ -123,319 +59,72 @@ docs/TEAM_SETUP.md
 .\stop_project.cmd
 ```
 
-后端健康检查：
+## 可选模型安装
 
-```text
-http://127.0.0.1:8000/api/health
+基础依赖足够启动 Demo。若要使用最佳效果，需要安装对应模型依赖并准备权重：
+
+```powershell
+backend\.venv\Scripts\python.exe -m pip install clearvoice speechbrain pystoi pesq
+backend\.venv\Scripts\python.exe scripts\download_models.py --separation --separation-model speechbrain/sepformer-libri2mix
 ```
+
+CUDA 环境下保持 PyTorch 与本机 CUDA 版本匹配。若模型加载失败，系统会自动回退到兜底轨道。
 
 ## 目录结构
 
 ```text
-Intelligent-Voice-Final-Project/
-  backend/
-    app/
-      main.py                 FastAPI 路由入口
-      models.py               API 数据结构
-      data/                   内置样例与缓存结果
-      services/               后端功能模块
-      static/                 音频、上传结果、可视化图片
-    tests/                    后端单元测试
-    requirements.txt          基础依赖
-    requirements-separation.txt  可选语音分离依赖
+backend/
+  app/main.py                 FastAPI 入口
+  app/services/               增强、分离、ASR、摘要等后端服务
+  app/static/audio/           内置演示音频
+  app/static/uploads/         运行时上传和输出目录
+  models/                     本地模型权重
+  checkpoints/                ClearVoice 等模型权重
+  tests/                      后端单元测试
 
-  frontend/
-    src/
-      App.jsx                 前端主页面状态与交互
-      api.js                  API 请求封装
-      components/             展示组件
-      styles.css              页面样式
+frontend/
+  src/App.jsx                 前端主页面
+  src/components/             音频试听、转写、摘要和诊断组件
 
-  docs/                       模块说明文档
-  scripts/download_models.py  可选模型权重预下载/预热脚本
-  scripts/stop_ports.ps1      端口清理脚本
-  install.sh                  一键安装依赖并启动前后端
-  install_project.cmd         Windows 一键安装依赖并启动前后端
-  start_project.cmd           一键启动前后端
-  stop_project.cmd            一键停止前后端
+docs/
+  ENHANCEMENT.md              语音增强模块说明
+  SEPARATION.md               语音分离模块说明
+  ASR.md                      ASR 模块说明
+  SUMMARY.md                  摘要模块说明
+  TEAM_SETUP.md               团队部署说明
+
+scripts/
+  download_models.py          必要模型下载和预热
+  run_backend.cmd             启动后端
+  run_frontend.cmd            启动前端
+  stop_ports.ps1              清理端口
 ```
 
-更详细的模块说明见：
+## 文档
 
-```text
-docs/PROJECT_STRUCTURE.md
-```
+最终文档只保留五份：
 
-## 后端模块
+- [语音增强](docs/ENHANCEMENT.md)
+- [语音分离](docs/SEPARATION.md)
+- [ASR 转写](docs/ASR.md)
+- [会议摘要](docs/SUMMARY.md)
+- [团队部署](docs/TEAM_SETUP.md)
 
-后端入口：
+## 测试
 
-```text
-backend/app/main.py
-```
-
-只负责 FastAPI 初始化、静态文件挂载、路由注册和基础参数校验。
-
-核心服务：
-
-- `pipeline_service.py`：完整流水线编排，连接增强、分块、分离、ASR 兜底和摘要。
-- `audio_service.py`：音频目录、上传归一化、时长读取、静态 URL 解析。
-- `enhancement_service.py`：语音增强和长音频分块增强策略。
-- `chunking_service.py`：长会议音频分块计划。
-- `separation_service.py`：说话人时间段轨道生成、可选 SpeechBrain SepFormer 分离与 placeholder 兜底。
-- `asr_service.py`：ASR 步骤说明和上传音频转写兜底。
-- `summary_service.py`：OpenAI-compatible LLM 摘要生成与缓存兜底。
-- `transcript_topic_service.py`：按时间块组织转写，并用 LLM 或兜底逻辑生成主题分组。
-- `upload_session_service.py`：分块上传会话、分片落盘和合并。
-- `visualization_service.py`：增强前后能量包络 SVG 图生成。
-- `demo_cache.py`：内置样例和缓存结果读取。
-
-## 前端模块
-
-前端入口：
-
-```text
-frontend/src/main.jsx
-```
-
-页面编排：
-
-```text
-frontend/src/App.jsx
-frontend/src/api.js
-```
-
-展示组件：
-
-- `Pipeline.jsx`：处理链路。
-- `AudioCompare.jsx`：增强试听、增强可视化、分离轨道、分块计划。
-- `Transcript.jsx`：带时间戳转写。
-- `Summary.jsx`：会议纪要。
-- `ProcessingDiagnostics.jsx`：后端耗时、模型状态和兜底原因等处理诊断。
-- `EmptyState.jsx`：初始和加载状态。
-
-## 大文件处理
-
-页面主入口“上传音频”现在使用分块上传，不再一次性把完整音频塞进浏览器和 FastAPI 内存。默认每块 `4 MB`，流程为：
-
-```text
-创建上传会话 -> 前端 File.slice 分块 -> 后端分片落盘 -> 合并文件 -> 进入处理流水线
-```
-
-相关接口：
-
-```text
-POST /api/upload-session
-POST /api/upload-session/{upload_id}/chunk
-POST /api/upload-session/{upload_id}/complete
-```
-
-分块大小可通过环境变量调整：
-
-```text
-UPLOAD_CHUNK_MB=4
-```
-
-前端默认使用 `VITE_UPLOAD_CHUNK_MB=4` 作为兜底分片大小；如果后端创建上传会话时返回了 `chunk_size_bytes`，页面会优先使用后端值。
-
-页面侧边栏仍保留“高级兜底：本地大文件路径”入口。它适合浏览器上传被系统策略拦截、文件位于后端同一台机器、或需要完全绕过浏览器传输时使用，例如：
-
-```text
-C:\workshop\school lesson\speech signal processing\final_work\train_S\wav\20200623_S_R001S01C01.flac
-```
-
-课堂演示优先使用“上传音频”按钮；路径入口只是备选方案。
-
-长音频保护策略：
-
-- 超过 `ENHANCEMENT_MAX_SECONDS=300` 秒：按 `ENHANCEMENT_CHUNK_SECONDS=60` 分块调用 DeepFilterNet，增强后再拼接。
-- 完整 pipeline 默认先执行 FunASR/SenseVoice + VAD + CAM++，再根据转写中的说话人时间段生成说话人轨道。
-- 只有在独立分离接口或显式配置 `SEPARATION_BACKEND=speechbrain` 时，才调用 SpeechBrain SepFormer。
-- FunASR 不可用时，上传流程会自动回退到 faster-whisper；超过 `ASR_MAX_SECONDS=600` 秒时 faster-whisper 回退路径按 `ASR_CHUNK_SECONDS=60` 分块转写。
-- 如需演示时跳过 DeepFilterNet，可设置 `DEEPFILTERNET_BACKEND=off`；如需仅对超长音频跳过增强，可设置 `ENHANCEMENT_SKIP_SECONDS`。
-- 模型不可用或单块推理失败时，才回退到兜底分离轨道/兜底转写，保证页面不崩。
-
-分块配置：
-
-```text
-CHUNK_SECONDS=60
-CHUNK_OVERLAP_SECONDS=5
-```
-
-## 语音增强可视化
-
-系统会为增强前后音频生成 SVG 图片，并返回：
-
-```text
-enhancement_visual_url
-```
-
-前端会显示增强前后的能量包络图，同时在“处理指标”中展示：
-
-- 原始平均能量
-- 增强后平均能量
-- 平均能量变化
-- 原始峰值
-- 增强后峰值
-
-这样展示时可以用“图 + 数据”说明增强效果。
-
-## 处理诊断
-
-后端会把各阶段耗时和模型状态写入 `signal_metrics`，前端 `ProcessingDiagnostics.jsx` 会集中展示。常见字段包括：
-
-```text
-runtime_normalize_seconds
-runtime_chunk_plan_seconds
-runtime_enhancement_seconds
-runtime_visual_seconds
-runtime_separation_seconds
-runtime_asr_seconds
-runtime_summary_seconds
-runtime_topic_seconds
-runtime_total_seconds
-```
-
-这些指标适合在调试或汇报时说明瓶颈位置，例如 DeepFilterNet 增强、SpeechBrain 分离、ASR 转写或 LLM 主题分类分别耗时多少，以及当前结果是否来自真实模型或兜底路径。
-
-## 语音分离
-
-短音频可使用 SpeechBrain SepFormer：
-
-```text
-SEPARATION_BACKEND=speechbrain
-SEPARATION_MODEL=speechbrain/sepformer-wsj02mix
-SEPARATION_DEVICE=auto
-SEPARATION_MAX_SECONDS=60
-SEPARATION_CHUNK_SECONDS=60
-SEPARATION_MAX_CHUNKS=120
-```
-
-安装可选依赖：
+运行后端关键测试：
 
 ```powershell
-backend\.venv\Scripts\python.exe -m pip install torch torchaudio --index-url https://download.pytorch.org/whl/cpu
-backend\.venv\Scripts\python.exe -m pip install -r backend\requirements-separation.txt
-```
-
-如果模型不可用、音频过长或推理失败，系统会自动回退到 placeholder 轨道，保证页面不崩。
-
-## ASR 转写
-
-上传音频、本地文件和分块上传完成后会优先调用 FunASR/SenseVoice 生成中文会议转写、VAD 分段和 CAM++ 说话人标签；如果 FunASR 不可用，则自动回退到本地 `faster-whisper`。推荐配置：
-
-```text
-ASR_BACKEND=funasr
-FUNASR_MODEL=iic/SenseVoiceSmall
-FUNASR_VAD_MODEL=fsmn-vad
-FUNASR_SPK_MODEL=cam++
-FUNASR_DEVICE=auto
-FASTER_WHISPER_MODEL=small
-ASR_DEVICE=auto
-ASR_COMPUTE_TYPE=auto
-ASR_LANGUAGE=zh
-ASR_MAX_SECONDS=600
-ASR_CHUNK_SECONDS=60
-ASR_MAX_CHUNKS=240
-ASR_VAD_FILTER=true
-ASR_BEAM_SIZE=1
-ASR_BEST_OF=1
-ASR_CPU_THREADS=0
-ASR_NUM_WORKERS=1
-ASR_CONDITION_ON_PREVIOUS_TEXT=false
-```
-
-安装可选依赖：
-
-```powershell
-backend\.venv\Scripts\python.exe -m pip install -r backend\requirements-asr.txt
-```
-
-如果未安装模型依赖、首次下载模型失败、音频超过 `ASR_MAX_SECONDS`，系统会自动回退到演示转写，不影响摘要和页面展示。详细说明见 `docs/ASR_SETUP.md`。
-
-## 摘要生成
-
-摘要模块支持 OpenAI-compatible Chat Completions API，可接 DeepSeek、OpenAI、通义兼容接口或本地兼容服务。
-
-配置文件：
-
-```text
-backend/.env
-```
-
-常用变量：
-
-```text
-LLM_ENABLED=false
-LLM_API_KEY=填写你的 API Key
-LLM_BASE_URL=https://api.deepseek.com/v1
-LLM_MODEL=deepseek-chat
-LLM_TIMEOUT_SECONDS=20
-LLM_TOPIC_WINDOW_SECONDS=120
-LLM_TOPIC_MAX_BLOCKS=80
-```
-
-稳定演示推荐设置 `LLM_ENABLED=false`，直接使用缓存/兜底摘要和兜底主题分组。`backend/.env.example` 展示的是真实 LLM 接入形态；如果没有配置 `LLM_API_KEY` 或接口失败，系统仍会自动回退。需要展示真实 LLM 摘要和主题分组时，设置 `LLM_ENABLED=true` 并配置 Key。
-
-详细教程见：
-
-```text
-docs/LLM_SUMMARY_SETUP.md
-```
-
-## 常用测试命令
-
-后端测试：
-
-```powershell
-backend\.venv\Scripts\python.exe -m unittest backend.tests.test_audio_service backend.tests.test_summary_service backend.tests.test_separation_service backend.tests.test_enhancement_service backend.tests.test_chunking_visualization backend.tests.test_upload_session_service backend.tests.test_asr_service
-```
-
-后端编译检查：
-
-```powershell
-backend\.venv\Scripts\python.exe -m compileall backend\app
+backend\.venv\Scripts\python.exe -m unittest backend.tests.test_audio_quality_service backend.tests.test_enhancement_service backend.tests.test_separation_service backend.tests.test_asr_service backend.tests.test_summary_service backend.tests.test_pipeline_service
 ```
 
 前端构建：
 
 ```powershell
 cd frontend
-npm.cmd run build
+npm run build
 ```
 
-## 文档索引
+## 清理原则
 
-- 项目结构：`docs/PROJECT_STRUCTURE.md`
-- LLM 摘要配置：`docs/LLM_SUMMARY_SETUP.md`
-- DeepFilterNet 增强配置：`docs/DEEPFILTERNET_SETUP.md`
-- SpeechBrain 分离配置：`docs/SPEECH_SEPARATION_SETUP.md`
-- faster-whisper 转写配置：`docs/ASR_SETUP.md`
-- 团队环境复现：`docs/TEAM_SETUP.md`
-
-## 课堂展示建议
-
-推荐展示顺序：
-
-1. 运行内置“带噪会议片段”，说明完整链路。
-2. 展示增强前后试听和增强可视化图。
-3. 展示分块处理计划，说明长会议音频如何避免内存爆掉。
-4. 展示说话人轨道，说明完整 pipeline 优先使用 FunASR/SenseVoice + VAD + CAM++；SpeechBrain SepFormer 是可选实验后端。
-5. 展示结构化会议纪要：主题、关键词、摘要、关键决策、待办事项。
-
-# 中文会议 Pipeline 升级说明
-
-新的默认设计面向中文课堂/会议展示：
-
-```text
-DeepFilterNet 增强 -> FunASR/SenseVoice 中文ASR -> fsmn-vad + cam++ 说话人分段 -> 说话人轨道 -> 主题转写 -> 会议纪要 -> 质量评分
-```
-
-核心创新点：
-
-- 中文会议自适应路由：FunASR 不可用时自动回退到 faster-whisper 或演示兜底。
-- 说话人轨道：根据说话人时间段生成可试听轨道，说明来源为 `FunASR speaker diarization gated track`。
-- 会议质量评估：输出语音覆盖率、疑似重叠比例、检测说话人数和 0-100 会议提取质量评分。
-- 可解释诊断：前端展示主处理后端、中文ASR模型、说话人分段模型和路由说明。
-
-详细说明见 `docs/CHINESE_MEETING_PIPELINE.md`。
+本交付版已经移除探究阶段的评测缓存、外部模型适配实验、候选 oracle 对比脚本和非最终文档。保留内容只服务于当前最佳运行路径、必要兜底路径和团队复现。
