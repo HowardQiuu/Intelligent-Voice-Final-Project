@@ -3,8 +3,17 @@ setlocal
 
 cd /d "%~dp0backend"
 
-if not exist ".venv\Scripts\python.exe" (
-  echo backend\.venv was not found.
+set "CONDA_BACKEND_PY=%USERPROFILE%\.conda\envs\voice-final-py311\python.exe"
+set "CONDA_BACKEND_SCRIPTS=%USERPROFILE%\.conda\envs\voice-final-py311\Scripts"
+
+if exist "%CONDA_BACKEND_PY%" (
+  set "BACKEND_PY=%CONDA_BACKEND_PY%"
+  set "PATH=%CONDA_BACKEND_SCRIPTS%;%PATH%"
+) else if exist ".venv\Scripts\python.exe" (
+  set "BACKEND_PY=.venv\Scripts\python.exe"
+  set "PATH=%CD%\.venv\Scripts;%PATH%"
+) else (
+  echo backend Python environment was not found.
   echo Please create/install the backend environment first.
   pause
   exit /b 1
@@ -22,6 +31,6 @@ set SEPARATION_MODEL=speechbrain/sepformer-wsj02mix
 set SEPARATION_DEVICE=cpu
 set SEPARATION_MAX_SECONDS=60
 
-".venv\Scripts\python.exe" -m uvicorn app.main:app --host 127.0.0.1 --port 8000
+"%BACKEND_PY%" -m uvicorn app.main:app --host 127.0.0.1 --port 8000
 
 pause

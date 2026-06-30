@@ -40,9 +40,11 @@ Copy-Item backend\.env.example backend\.env
 ```text
 QUALITY_ROUTER_ENABLED=true
 SEPARATION_INPUT_SOURCE=raw
-SEPARATION_CANDIDATES=libri2mix,mossformer2,gated
+SEPARATION_CANDIDATES=libri2mix,mossformer2,resepformer
 SEPARATION_MODEL=speechbrain/sepformer-libri2mix
 MOSSFORMER2_SEPARATION_MODEL=MossFormer2_SS_16K
+SEPARATION_RECURSIVE_EXPANSION=true
+SEPARATION_RECURSIVE_MODE=direct_split
 ```
 
 如需 LLM 摘要，在 `backend/.env` 中配置：
@@ -110,6 +112,6 @@ npm run build
 如果分离模型失败：
 
 - 确认 `speechbrain`、`clearvoice`、`torch`、`torchaudio` 已安装。
-- 确认 `SEPARATION_CANDIDATES=libri2mix,mossformer2,gated`。
+- 确认 `SEPARATION_CANDIDATES=libri2mix,mossformer2,resepformer`。
 - 查看后端返回的 `分离状态` 和 `quality_router_*` 指标。
-- 模型不可用时允许进入 `gated` 或 `placeholder` 兜底。
+- 模型不可用时只允许进入 `placeholder` 兜底，不再使用 gated 假分离轨道。

@@ -3,16 +3,16 @@ from __future__ import annotations
 import uuid
 from pathlib import Path
 
-from dotenv import load_dotenv
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
+from .env_loader import load_backend_env
+
 BACKEND_DIR = Path(__file__).resolve().parents[1]
-load_dotenv(BACKEND_DIR / ".env")
+load_backend_env(BACKEND_DIR)
 
 from .models import (
-    LocalFileRequest,
     ProcessResult,
     UploadSessionCompleteRequest,
     UploadSessionCreateRequest,
@@ -26,7 +26,6 @@ from .services.pipeline_service import (
     process_demo_case,
     save_upload_stream,
     separate_uploaded_path,
-    stage_local_file,
 )
 from .services.separation_service import separate_demo_audio
 from .services.upload_session_service import (
@@ -49,7 +48,7 @@ app.add_middleware(
 )
 
 ensure_audio_dirs()
-ensure_demo_audios([case["id"] for case in load_demo_cases()])
+ensure_demo_audios([case["id"] for case in load_demo_cases() if not case.get("audio_path")])
 app.mount("/static", StaticFiles(directory=Path(__file__).resolve().parent / "static"), name="static")
 
 
@@ -64,9 +63,9 @@ def demo_cases() -> list[dict]:
 
 
 @app.post("/api/process-demo/{case_id}", response_model=ProcessResult)
-def process_demo(case_id: str) -> ProcessResult:
+def process_demo(case_id: str, processing_mode: str = "fast") -> ProcessResult:
     try:
-        return process_demo_case(case_id)
+        return process_demo_case(case_id, processing_mode=processing_mode)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="Demo case not found") from exc
 
@@ -88,12 +87,12 @@ def separate_demo(case_id: str) -> dict:
 
 
 @app.post("/api/upload", response_model=ProcessResult)
-async def upload_audio(file: UploadFile = File(...)) -> ProcessResult:
+async def upload_audio(file: UploadFile = File(...), processing_mode: str = "fast") -> ProcessResult:
     suffix = _validate_audio_suffix(file.filename or "meeting.wav")
     UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
     raw_path = UPLOAD_DIR / f"{uuid.uuid4().hex}{suffix}"
     await save_upload_stream(file, raw_path)
-    return process_audio_path(raw_path, file.filename or raw_path.name, case_id="upload")
+    return process_audio_path(raw_path, file.filename or raw_path.name, case_id="upload", processing_mode=processing_mode)
 
 
 @app.post("/api/upload-session", response_model=UploadSessionResponse)
@@ -121,15 +120,12 @@ def complete_chunked_upload(upload_id: str, request: UploadSessionCompleteReques
         raise HTTPException(status_code=404, detail="Upload session not found") from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    return process_audio_path(raw_path, request.filename or display_name, case_id="upload")
-
-
-@app.post("/api/process-local-file", response_model=ProcessResult)
-def process_local_file(request: LocalFileRequest) -> ProcessResult:
-    source_path = Path(request.path).expanduser()
-    _validate_local_audio_file(source_path)
-    staged_path = stage_local_file(source_path)
-    return process_audio_path(staged_path, source_path.name, case_id="local-file")
+    return process_audio_path(
+        raw_path,
+        request.filename or display_name,
+        case_id="upload",
+        processing_mode=request.processing_mode,
+    )
 
 
 @app.post("/api/separate-upload")
@@ -146,9 +142,3 @@ def _validate_audio_suffix(filename: str) -> str:
     if suffix not in ALLOWED_AUDIO_SUFFIXES:
         raise HTTPException(status_code=400, detail="Unsupported audio format")
     return suffix
-
-
-def _validate_local_audio_file(path: Path) -> None:
-    if not path.exists() or not path.is_file():
-        raise HTTPException(status_code=404, detail="Local audio file not found")
-    _validate_audio_suffix(path.name)

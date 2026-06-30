@@ -13,6 +13,9 @@ class TranscriptSegment(BaseModel):
     end: str
     speaker: str
     text: str
+    primary_track_id: str | None = None
+    primary_track_label: str | None = None
+    separation_tracks: list[str] = Field(default_factory=list)
 
 
 class TranscriptTopicBlock(BaseModel):
@@ -65,14 +68,13 @@ class ProcessResult(BaseModel):
     direct_asr_text: str
     enhanced_asr_text: str
     signal_metrics: dict[str, str]
+    speaker_count_estimation: dict = Field(default_factory=dict)
     steps: list[PipelineStep]
     transcript: list[TranscriptSegment]
     transcript_topics: list[TranscriptTopic] = Field(default_factory=list)
+    separation_alignment: dict = Field(default_factory=dict)
+    separation_evaluation: dict = Field(default_factory=dict)
     summary: MeetingSummary
-
-
-class LocalFileRequest(BaseModel):
-    path: str
 
 
 class UploadSessionCreateRequest(BaseModel):
@@ -89,3 +91,4 @@ class UploadSessionResponse(BaseModel):
 class UploadSessionCompleteRequest(BaseModel):
     filename: str
     total_chunks: int = Field(ge=1)
+    processing_mode: str = "fast"

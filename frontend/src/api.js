@@ -13,13 +13,14 @@ export async function fetchDemoCases() {
   return response.json();
 }
 
-export async function processDemo(caseId) {
-  const response = await fetch(`${API_BASE}/api/process-demo/${caseId}`, { method: "POST" });
+export async function processDemo(caseId, processingMode = "fast") {
+  const params = new URLSearchParams({ processing_mode: processingMode });
+  const response = await fetch(`${API_BASE}/api/process-demo/${caseId}?${params}`, { method: "POST" });
   if (!response.ok) throw new Error("demo process failed");
   return response.json();
 }
 
-export async function uploadAudioFile(file, onProgress) {
+export async function uploadAudioFile(file, processingMode = "fast", onProgress) {
   const session = await createUploadSession(file);
   const chunkSize = session.chunk_size_bytes || UPLOAD_CHUNK_MB * 1024 * 1024;
   const totalChunks = session.total_chunks || Math.ceil(file.size / chunkSize);
@@ -46,20 +47,10 @@ export async function uploadAudioFile(file, onProgress) {
   const complete = await fetch(`${API_BASE}/api/upload-session/${session.upload_id}/complete`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ filename: file.name, total_chunks: totalChunks }),
+    body: JSON.stringify({ filename: file.name, total_chunks: totalChunks, processing_mode: processingMode }),
   });
   if (!complete.ok) throw new Error("upload complete failed");
   return complete.json();
-}
-
-export async function processLocalFile(path) {
-  const response = await fetch(`${API_BASE}/api/process-local-file`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ path }),
-  });
-  if (!response.ok) throw new Error("local file process failed");
-  return response.json();
 }
 
 async function createUploadSession(file) {

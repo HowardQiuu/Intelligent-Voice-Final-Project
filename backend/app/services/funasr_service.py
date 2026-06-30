@@ -116,7 +116,10 @@ def _load_automodel_class() -> Any:
     _ensure_modelscope_runtime()
     _ensure_ffmpeg_on_path()
     module = importlib.import_module("funasr")
-    return getattr(module, "AutoModel")
+    if hasattr(module, "AutoModel"):
+        return getattr(module, "AutoModel")
+    auto_model_module = importlib.import_module("funasr.auto.auto_model")
+    return getattr(auto_model_module, "AutoModel")
 
 
 def _ensure_modelscope_runtime() -> None:

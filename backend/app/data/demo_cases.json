@@ -1,26 +1,29 @@
 [
   {
-    "id": "clear_meeting",
-    "name": "清晰会议片段",
-    "scene": "小型项目同步会，环境较安静",
-    "duration": "01:20",
-    "noise_level": "低",
-    "description": "用于展示系统在正常会议录音下的完整处理流程。"
+    "id": "R8001_M8004",
+    "name": "Near-mix 会议 R8001_M8004",
+    "scene": "AliMeeting near/headset 4 人混合音频",
+    "duration": "25:51",
+    "noise_level": "近讲混合",
+    "audio_path": "data/near_mix_dataset_v1/audio/R8001_M8004_near_all_speakers_mix.wav",
+    "description": "由 4 条近讲说话人源轨合成，适合验证多说话人重叠场景下的分离轨道。"
   },
   {
-    "id": "noisy_meeting",
-    "name": "带噪会议片段",
-    "scene": "会议室空调、键盘和设备风扇噪声",
-    "duration": "01:35",
-    "noise_level": "中高",
-    "description": "用于展示语音增强前后音频听感与转写质量差异。"
+    "id": "R8003_M8001",
+    "name": "Near-mix 会议 R8003_M8001",
+    "scene": "AliMeeting near/headset 4 人混合音频",
+    "duration": "34:27",
+    "noise_level": "近讲混合",
+    "audio_path": "data/near_mix_dataset_v1/audio/R8003_M8001_near_all_speakers_mix.wav",
+    "description": "由 4 条近讲说话人源轨合成，会议更长，适合压力测试分块处理与分离稳定性。"
   },
   {
-    "id": "overlap_meeting",
-    "name": "多人讨论片段",
-    "scene": "多人短时插话和发言切换",
-    "duration": "01:10",
-    "noise_level": "中",
-    "description": "用于展示说话人分段、转写和会议纪要生成能力。"
+    "id": "R8007_M8010",
+    "name": "Near-mix 会议 R8007_M8010",
+    "scene": "AliMeeting near/headset 4 人混合音频",
+    "duration": "30:58",
+    "noise_level": "近讲混合",
+    "audio_path": "data/near_mix_dataset_v1/audio/R8007_M8010_near_all_speakers_mix.wav",
+    "description": "由 4 条近讲说话人源轨合成，用于对比 fast quality-router 与完整处理流程。"
   }
 ]

@@ -1,0 +1,14 @@
+{
+  "created_at": "2026-06-30 18:38:07",
+  "dataset_type": "AliMeeting near/headset all-speaker close-talk mixtures",
+  "warning": "Mixtures are synthesized from near/headset tracks. They are clearer than far-field recordings and should be reported as close-talk validation mixtures.",
+  "near_data_dir": "data\\source\\Eval_Ali_near (source dataset used during generation; not required for using this derived dataset)",
+  "output_dir": "data\\near_mix_dataset_v1",
+  "meeting_count": 3,
+  "total_duration_seconds": 5477.493,
+  "mask_inactive": true,
+  "source_rms": 0.06,
+  "peak": 0.95,
+  "chunk_seconds": 20.0,
+  "manifest_path": "data\\near_mix_dataset_v1\\manifest.jsonl"
+}

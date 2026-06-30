@@ -9,7 +9,7 @@
 -> 音频标准化
 -> 语音增强
 -> 最佳分离路径：Libri2Mix SepFormer / ClearVoice MossFormer2 质量路由
--> 兜底路径：FunASR 说话人分段门控轨道 / placeholder 轨道
+-> 兜底路径：placeholder 轨道
 -> ASR 转写
 -> 主题整理与会议摘要
 -> 前端试听、转写和摘要展示
@@ -20,12 +20,14 @@
 ```text
 QUALITY_ROUTER_ENABLED=true
 SEPARATION_INPUT_SOURCE=raw
-SEPARATION_CANDIDATES=libri2mix,mossformer2,gated
+SEPARATION_CANDIDATES=libri2mix,mossformer2,resepformer
 SEPARATION_MODEL=speechbrain/sepformer-libri2mix
 MOSSFORMER2_SEPARATION_MODEL=MossFormer2_SS_16K
+SEPARATION_RECURSIVE_EXPANSION=true
+SEPARATION_RECURSIVE_MODE=direct_split
 ```
 
-其中 `libri2mix` 和 `mossformer2` 是最终保留的真实盲源分离候选；`gated` 和 `placeholder` 是兜底展示路径，保证模型不可用或输入不适合分离时页面仍能返回可试听轨道。
+其中 `libri2mix`、`mossformer2` 和 `resepformer` 是最终保留的真实盲源分离候选；模型不可用或输入不适合分离时只允许退回 `placeholder`，不再使用说话人分段门控轨道冒充分离结果。
 
 ## 启动方式
 
@@ -82,6 +84,9 @@ backend/
   checkpoints/                ClearVoice 等模型权重
   tests/                      后端单元测试
 
+data/
+  near_mix_dataset_v1/        最终保留的 near/headset close-talk 混合验证数据集
+
 frontend/
   src/App.jsx                 前端主页面
   src/components/             音频试听、转写、摘要和诊断组件
@@ -94,6 +99,7 @@ docs/
   TEAM_SETUP.md               团队部署说明
 
 scripts/
+  create_near_mix_dataset.py  从 AliMeeting near 原始包复现生成 near-mix 数据集
   download_models.py          必要模型下载和预热
   run_backend.cmd             启动后端
   run_frontend.cmd            启动前端

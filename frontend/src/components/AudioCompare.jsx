@@ -31,6 +31,7 @@ export function AudioCompare({ result }) {
       {result.separated_tracks?.length > 0 && (
         <div className="separation-list">
           <h3>说话人轨道 / 分离轨道</h3>
+          <SpeakerCountDiagnostics estimation={result.speaker_count_estimation} />
           <div className="track-grid">
             {result.separated_tracks.map((track) => (
               <div className="audio-card separated" key={track.track_id}>
@@ -40,6 +41,8 @@ export function AudioCompare({ result }) {
               </div>
             ))}
           </div>
+          <SeparationAlignment alignment={result.separation_alignment} transcript={result.transcript || []} />
+          <TextgridEvaluation evaluation={result.separation_evaluation} />
         </div>
       )}
 
@@ -56,6 +59,141 @@ export function AudioCompare({ result }) {
       <ChunkPlan chunks={result.processing_chunks || []} />
     </section>
   );
+}
+
+function SpeakerCountDiagnostics({ estimation }) {
+  if (!estimation || !estimation.status) return null;
+  const tracks = estimation.tracks || [];
+  const clusters = estimation.clusters || [];
+  return (
+    <div className="speaker-count-panel">
+      <div className="speaker-count-summary">
+        <span>
+          <strong>{estimation.global_estimated_speaker_count ?? estimation.estimated_speaker_count ?? 0}</strong>
+          估计人数
+        </span>
+        <span>
+          <strong>{estimation.embedding_backend || "-"}</strong>
+          embedding
+        </span>
+        <span>
+          <strong>{estimation.embedding_backend_status || estimation.status}</strong>
+          后端状态
+        </span>
+        <span>
+          <strong>{formatDecimal(estimation.cluster_stability ?? estimation.stability_score)}</strong>
+          聚类稳定性
+        </span>
+      </div>
+      {clusters.length > 0 && (
+        <div className="speaker-cluster-grid">
+          {clusters.map((cluster) => (
+            <div className="speaker-cluster" key={cluster.global_speaker_id || cluster.cluster_id}>
+              <strong>{speakerDisplayName(cluster.global_speaker_id || cluster.cluster_id)}</strong>
+              <span>{(cluster.track_ids || []).length} tracks</span>
+              <small>
+                sim {formatDecimal(cluster.mean_similarity)} / stable {formatDecimal(cluster.stability_score)}
+              </small>
+            </div>
+          ))}
+        </div>
+      )}
+      {tracks.length > 0 && (
+        <div className="speaker-track-tags">
+          {tracks
+            .filter((track) => track.accepted)
+            .slice(0, 12)
+            .map((track) => (
+              <span key={track.track_id}>
+                {track.label || speakerDisplayName(track.global_speaker_id)} / q {formatDecimal(track.quality_score)}
+              </span>
+            ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function SeparationAlignment({ alignment, transcript }) {
+  if (!alignment || alignment.status !== "ok") return null;
+  const alignedSegments = (transcript || []).filter((segment) => segment.primary_track_id);
+  return (
+    <div className="alignment-panel">
+      <h3>ASR 分段与分离轨道对齐</h3>
+      <div className="alignment-summary">
+        <span>已对齐分段：{alignment.aligned_segments || 0}</span>
+        <span>多轨重叠分段：{alignment.multi_track_segments || 0}</span>
+        <span>分离轨道数：{alignment.track_count || 0}</span>
+      </div>
+      <div className="alignment-grid">
+        {alignedSegments.slice(0, 6).map((segment, index) => (
+          <div className="alignment-row" key={`${segment.start}-${segment.end}-${index}`}>
+            <strong>
+              {segment.start}-{segment.end}
+            </strong>
+            <span>{segment.primary_track_label || segment.primary_track_id}</span>
+            <small>{segment.text || "无文本"}</small>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function TextgridEvaluation({ evaluation }) {
+  const matches = evaluation?.track_matches || [];
+  if (!evaluation || evaluation.source !== "textgrid") return null;
+  return (
+    <div className="alignment-panel">
+      <h3>TextGrid 分离效果验证</h3>
+      <div className="alignment-summary">
+        <span>状态：{evaluation.status}</span>
+        <span>参考说话人：{evaluation.reference_speaker_count || 0}</span>
+        <span>参考重叠比例：{formatPercent(evaluation.reference_overlap_ratio)}</span>
+      </div>
+      {matches.length > 0 && (
+        <div className="alignment-grid">
+          {matches.map((item) => (
+            <div className="alignment-row" key={item.track_id}>
+              <strong>{item.track_label || item.track_id}</strong>
+              <span>{item.matched_reference_speaker || "未匹配"}</span>
+              <small>
+                文本相似度 {formatPercent(item.text_similarity)} / {item.match_method}
+              </small>
+            </div>
+          ))}
+        </div>
+      )}
+      {evaluation.overlap_segments?.length > 0 && (
+        <div className="overlap-list">
+          {evaluation.overlap_segments.slice(0, 4).map((item, index) => (
+            <span key={`${item.start}-${index}`}>
+              {item.start}-{item.end}: {(item.speakers || []).join(" + ")}
+            </span>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function formatPercent(value) {
+  const numeric = Number(value || 0);
+  return `${Math.round(numeric * 100)}%`;
+}
+
+function formatDecimal(value) {
+  const numeric = Number(value || 0);
+  return numeric.toFixed(2);
+}
+
+function speakerDisplayName(value) {
+  const text = String(value || "");
+  const match = text.match(/^speaker_(\d+)$/);
+  if (!match) return text || "未分配";
+  const index = Number(match[1]);
+  if (index >= 1 && index <= 26) return `说话人 ${String.fromCharCode(64 + index)}`;
+  return `说话人 ${index}`;
 }
 
 function ChunkPlan({ chunks }) {

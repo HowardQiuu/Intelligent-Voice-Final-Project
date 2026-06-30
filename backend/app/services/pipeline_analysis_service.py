@@ -171,8 +171,6 @@ def _route_explanation(asr_metrics: dict[str, str], separation: dict, overlap_ra
         base = "真实ASR不可用时使用演示兜底，保证页面和摘要流程稳定"
     if "speechbrain" in separation_method or "mossformer2" in separation_method or "clearvoice" in separation_method:
         separation_note = "当前使用真实盲源分离候选输出多轨音频"
-    elif "gated" in separation_method:
-        separation_note = "当前使用说话人分段门控轨道，用于试听而非硬盲源分离"
     else:
         separation_note = "当前分离输出由质量路由或兜底策略决定"
     if overlap_ratio >= 0.08:

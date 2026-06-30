@@ -11,10 +11,9 @@ from unittest.mock import patch
 BACKEND_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(BACKEND_DIR))
 
-from app.services.audio_service import UPLOAD_DIR, audio_url  # noqa: E402
+from app.services.audio_service import UPLOAD_DIR  # noqa: E402
 from app.services.funasr_service import parse_funasr_sentence_info  # noqa: E402
 from app.services.pipeline_analysis_service import build_meeting_analysis_metrics  # noqa: E402
-from app.services.separation_service import build_speaker_tracks_from_transcript  # noqa: E402
 
 
 class ChineseMeetingPipelineTest(unittest.TestCase):
@@ -76,23 +75,6 @@ class ChineseMeetingPipelineTest(unittest.TestCase):
         self.assertEqual(transcript[0]["speaker"], "说话人 A")
         self.assertEqual(transcript[0]["end"], "00:08")
 
-    def test_speaker_tracks_from_transcript_generate_wav_outputs(self) -> None:
-        source = _write_wav("meeting_pipeline_test_source.wav", seconds=4)
-        transcript = [
-            {"start": "00:00", "end": "00:02", "speaker": "说话人 A", "text": "第一位发言"},
-            {"start": "00:02", "end": "00:04", "speaker": "说话人 B", "text": "第二位发言"},
-        ]
-
-        result = build_speaker_tracks_from_transcript(audio_url(source), transcript)
-
-        self.assertEqual(result["status"], "ok-diarization-gated")
-        self.assertEqual(result["track_count"], "2")
-        self.assertIn("FunASR speaker diarization gated track", result["tracks"][0]["description"])
-        for track in result["tracks"]:
-            output = UPLOAD_DIR / Path(track["audio_url"]).name
-            self.assertTrue(output.exists())
-            self.assertGreater(output.stat().st_size, 0)
-
     def test_meeting_analysis_metrics_include_quality_and_route(self) -> None:
         source = _write_wav("meeting_pipeline_test_analysis.wav", seconds=6)
         transcript = [
@@ -104,7 +86,7 @@ class ChineseMeetingPipelineTest(unittest.TestCase):
             audio_path=source,
             transcript=transcript,
             asr_metrics={"ASR 后端": "funasr", "ASR 状态": "success", "主处理后端": "FunASR中文会议转写"},
-            separation={"status": "ok-diarization-gated"},
+            separation={"status": "ok", "method": "SpeechBrain SepFormer"},
         )
 
         self.assertEqual(metrics["检测说话人数"], "2")

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib
+import itertools
 import math
 import os
 import re
@@ -12,20 +13,30 @@ from pathlib import Path
 from typing import Any
 import threading
 
-from dotenv import load_dotenv
-
+from ..env_loader import load_backend_env
 from .audio_service import UPLOAD_DIR, audio_url, ffmpeg_executable, get_audio_duration_seconds, resolve_static_url
 from .audio_quality_service import analyze_audio_quality, score_audio_quality
+from .speaker_count_estimation_service import add_speaker_count_estimation
 
 
 BACKEND_DIR = Path(__file__).resolve().parents[2]
-load_dotenv(BACKEND_DIR / ".env")
+load_backend_env(BACKEND_DIR)
 
 DEFAULT_SEPARATION_MODEL = "speechbrain/sepformer-libri2mix"
 DEFAULT_SEPARATION_DEVICE = "auto"
 DEFAULT_MAX_SECONDS = 60.0
 DEFAULT_CHUNK_SECONDS = 60.0
 DEFAULT_MAX_CHUNKS = 120
+DEFAULT_CHUNK_ALIGNMENT_SIMILARITY_FLOOR = 0.15
+DEFAULT_RECURSIVE_MAX_TRACKS = 6
+DEFAULT_RECURSIVE_MAX_STEPS = 4
+DEFAULT_RECURSIVE_MODE = "direct_split"
+DEFAULT_AUTO_RECURSIVE_MAX_TRACKS = 6
+DEFAULT_AUTO_RECURSIVE_MAX_DEPTH = 1
+DEFAULT_AUTO_RECURSIVE_MIN_ENERGY_BALANCE = 0.08
+DEFAULT_AUTO_RECURSIVE_MIN_ACTIVE_RATIO = 0.08
+DEFAULT_AUTO_RECURSIVE_MAX_CHILD_CORRELATION = 0.92
+DEFAULT_AUTO_RECURSIVE_MIN_QUALITY = 0.16
 SPEECHBRAIN_SAVEDIR = BACKEND_DIR / "models" / "speechbrain" / "sepformer-libri2mix"
 _SEPARATOR_CACHE: dict[tuple[str, str], Any] = {}
 _CLEARVOICE_SEPARATOR_CACHE: dict[tuple[str, str], Any] = {}
@@ -60,22 +71,33 @@ def separate_uploaded_audio(enhanced_audio_url: str) -> dict:
     )
 
 
-def separate_with_quality_router(enhanced_audio_url: str, transcript: list[dict] | None = None) -> dict:
+def separate_with_quality_router(
+    enhanced_audio_url: str,
+    transcript: list[dict] | None = None,
+    *,
+    reference_audio_path: Path | None = None,
+    display_name: str = "",
+    expected_speakers: int | None = None,
+) -> dict:
+    _ = reference_audio_path, display_name
+
     if not _quality_router_enabled():
-        diarized = build_speaker_tracks_from_transcript(enhanced_audio_url, transcript or [])
-        if diarized.get("method") != "Placeholder fallback":
-            return diarized
         return separate_uploaded_audio(enhanced_audio_url)
 
-    expected_speakers = _get_expected_speaker_count(transcript or [])
+    expected_speaker_count = _get_expected_speaker_count(expected_speakers)
     overlap_ratio = _transcript_overlap_ratio(transcript or [])
     attempts = []
     for candidate in _get_separation_candidates():
         try:
-            result = _run_separation_candidate(candidate, enhanced_audio_url, transcript or [])
+            result = _run_separation_candidate(
+                candidate,
+                enhanced_audio_url,
+                transcript or [],
+                expected_speakers=expected_speaker_count,
+            )
             score = _score_separation_result(
                 result,
-                expected_speakers=expected_speakers,
+                expected_speakers=expected_speaker_count,
                 overlap_ratio=overlap_ratio,
             )
             attempts.append({"candidate": candidate, "result": result, "score": score, "status": "ok"})
@@ -85,10 +107,10 @@ def separate_with_quality_router(enhanced_audio_url: str, transcript: list[dict]
     valid = [item for item in attempts if item.get("status") == "ok"]
     if not valid:
         fallback = _placeholder_upload_result(enhanced_audio_url)
-        return {
+        return add_speaker_count_estimation({
             **_with_fallback_status(fallback, "Quality router fallback: no separation candidate succeeded"),
             "metrics": _separation_candidate_metrics(attempts, "placeholder"),
-        }
+        })
 
     _apply_candidate_diagnostic_rerank(valid, enhanced_audio_url)
     selected = max(valid, key=lambda item: item["score"])
@@ -99,42 +121,11 @@ def separate_with_quality_router(enhanced_audio_url: str, transcript: list[dict]
         **_separation_candidate_metrics(attempts, selected["candidate"]),
         "quality_router_selected_separation_score": f"{selected['score']:.1f}",
     }
-    if expected_speakers:
-        result["metrics"]["quality_router_expected_speakers"] = str(expected_speakers)
+    if expected_speaker_count:
+        result["metrics"]["quality_router_expected_speakers"] = str(expected_speaker_count)
     if overlap_ratio > 0:
         result["metrics"]["quality_router_transcript_overlap_ratio"] = f"{overlap_ratio:.3f}"
-    return result
-
-
-def build_speaker_tracks_from_transcript(enhanced_audio_url: str, transcript: list[dict]) -> dict:
-    """Create stable per-speaker listening tracks from diarized transcript intervals.
-
-    This is intentionally a meeting-diarization track, not a claim of hard blind-source
-    waveform separation. Non-target speaker regions are attenuated so the classroom demo
-    can audibly inspect each speaker stream while keeping the full meeting timeline.
-    """
-    source_path = _resolve_static_url(enhanced_audio_url)
-    fallback = _placeholder_upload_result(enhanced_audio_url)
-    intervals = _speaker_intervals(transcript)
-    if source_path is None or not source_path.exists():
-        return _with_fallback_status(fallback, "Fallback enhanced mix: enhanced audio file not found")
-    if not intervals:
-        return _with_fallback_status(fallback, "Fallback enhanced mix: no speaker timestamps")
-
-    try:
-        tracks = _write_gated_speaker_tracks(source_path, intervals)
-    except Exception as exc:
-        return _with_fallback_status(fallback, f"Fallback enhanced mix: gated track failed: {_short_error(exc)}")
-
-    if not tracks:
-        return _with_fallback_status(fallback, "Fallback enhanced mix: no speaker tracks generated")
-    return {
-        "method": "FunASR speaker diarization gated tracks",
-        "status": "ok-diarization-gated",
-        "track_count": str(len(tracks)),
-        "tracks": tracks,
-    }
-
+    return add_speaker_count_estimation(result)
 
 def _separate_audio(source_path: Path | None, source_url: str, output_stem: str, fallback: dict) -> dict:
     backend = os.getenv("SEPARATION_BACKEND", "placeholder").strip().lower() or "placeholder"
@@ -251,6 +242,9 @@ def _separate_with_speechbrain_chunks(
     try:
         chunk_paths = _split_audio_to_chunks(source_path, work_dir, chunk_seconds, duration)
         grouped: dict[int, list[Path]] = {}
+        prototypes: dict[int, Any] = {}
+        chunk_alignment_scores: list[float] = []
+        expected_track_count = 0
         for chunk_index, chunk_path in enumerate(chunk_paths, start=1):
             result = _separate_with_speechbrain(
                 chunk_path,
@@ -259,12 +253,30 @@ def _separate_with_speechbrain_chunks(
                 model_name_override=model_name_override,
                 refine_tracks=refine_tracks,
             )
-            for speaker_index, track in enumerate(result["tracks"], start=1):
+            chunk_track_paths = []
+            for track in result["tracks"]:
                 track_path = resolve_static_url(track["audio_url"])
                 if track_path is None or not track_path.exists():
                     raise RuntimeError(f"Separated chunk track missing: {track['audio_url']}")
-                grouped.setdefault(speaker_index, []).append(track_path)
+                chunk_track_paths.append(track_path)
                 intermediate_tracks.append(track_path)
+            if not chunk_track_paths:
+                raise RuntimeError(f"SpeechBrain returned no separated tracks for chunk {chunk_index}")
+            if chunk_index == 1:
+                expected_track_count = len(chunk_track_paths)
+            elif len(chunk_track_paths) != expected_track_count:
+                raise RuntimeError(
+                    "Chunked SpeechBrain returned inconsistent track counts: "
+                    f"chunk 1 has {expected_track_count}, chunk {chunk_index} has {len(chunk_track_paths)}"
+                )
+
+            aligned_paths, alignment_scores, prototypes = _align_chunk_tracks_to_prototypes(
+                chunk_track_paths,
+                prototypes,
+            )
+            chunk_alignment_scores.extend(alignment_scores)
+            for speaker_index, track_path in enumerate(aligned_paths, start=1):
+                grouped.setdefault(speaker_index, []).append(track_path)
 
         if not grouped:
             raise RuntimeError("SpeechBrain returned no separated chunk tracks")
@@ -285,13 +297,14 @@ def _separate_with_speechbrain_chunks(
                 }
             )
 
+        alignment_metrics = _chunk_alignment_metrics(chunk_alignment_scores)
         consistency_metrics = _apply_mixture_consistency_projection(source_path, tracks)
         return {
             "method": f"SpeechBrain SepFormer chunked ({len(chunk_paths)} chunks x {chunk_seconds:g}s)",
             "status": "ok-chunked",
             "track_count": str(len(tracks)),
             "tracks": tracks,
-            "metrics": consistency_metrics,
+            "metrics": {**alignment_metrics, **consistency_metrics},
         }
     finally:
         shutil.rmtree(work_dir, ignore_errors=True)
@@ -299,50 +312,816 @@ def _separate_with_speechbrain_chunks(
             track_path.unlink(missing_ok=True)
 
 
-def _run_separation_candidate(candidate: str, enhanced_audio_url: str, transcript: list[dict]) -> dict:
+def _align_chunk_tracks_to_prototypes(
+    chunk_track_paths: list[Path],
+    prototypes: dict[int, Any],
+) -> tuple[list[Path], list[float], dict[int, Any]]:
+    signatures = [_chunk_track_signature(path) for path in chunk_track_paths]
+    if not prototypes:
+        next_prototypes = {
+            index: signature
+            for index, signature in enumerate(signatures, start=1)
+            if signature is not None
+        }
+        return chunk_track_paths, [], next_prototypes
+
+    track_count = len(chunk_track_paths)
+    speaker_indexes = list(range(1, track_count + 1))
+    best_order = list(range(track_count))
+    best_score = -1.0
+    for order in itertools.permutations(range(track_count)):
+        scores = [
+            _chunk_track_similarity(prototypes.get(speaker_index), signatures[track_index])
+            for speaker_index, track_index in zip(speaker_indexes, order)
+        ]
+        score = sum(scores) / len(scores) if scores else -1.0
+        if score > best_score:
+            best_score = score
+            best_order = list(order)
+
+    if best_score < _get_chunk_alignment_similarity_floor():
+        best_order = list(range(track_count))
+    aligned_paths = [chunk_track_paths[index] for index in best_order]
+    aligned_signatures = [signatures[index] for index in best_order]
+    alignment_scores = [
+        _chunk_track_similarity(prototypes.get(speaker_index), signature)
+        for speaker_index, signature in zip(speaker_indexes, aligned_signatures)
+    ]
+    next_prototypes = dict(prototypes)
+    for speaker_index, signature in zip(speaker_indexes, aligned_signatures):
+        if signature is None:
+            continue
+        previous = next_prototypes.get(speaker_index)
+        next_prototypes[speaker_index] = signature if previous is None else (previous * 0.8 + signature * 0.2)
+    return aligned_paths, alignment_scores, next_prototypes
+
+
+def _chunk_track_signature(track_path: Path) -> Any | None:
+    try:
+        soundfile = importlib.import_module("soundfile")
+        numpy = importlib.import_module("numpy")
+        data, sample_rate = soundfile.read(str(track_path), always_2d=True, dtype="float32")
+        mono = data.mean(axis=1).astype("float32")
+        if len(mono) == 0:
+            return None
+
+        frame = max(256, int(sample_rate * 0.064))
+        hop = max(128, frame // 2)
+        if len(mono) < frame:
+            padded = numpy.zeros(frame, dtype="float32")
+            padded[: len(mono)] = mono
+            frames = [padded]
+        else:
+            frames = [mono[index : index + frame] for index in range(0, len(mono) - frame + 1, hop)]
+        if not frames:
+            return None
+
+        rms = numpy.asarray([float(numpy.sqrt(numpy.mean(frame_data * frame_data) + 1e-9)) for frame_data in frames])
+        active_threshold = max(float(numpy.percentile(rms, 75)) * 0.35, 1e-5)
+        active_frames = [frame_data for frame_data, energy in zip(frames, rms) if energy >= active_threshold]
+        if not active_frames:
+            active_frames = frames[: min(8, len(frames))]
+
+        window = numpy.hanning(frame).astype("float32")
+        spectra = []
+        zcr_values = []
+        centroid_values = []
+        freqs = numpy.fft.rfftfreq(frame, d=1.0 / float(sample_rate))
+        for frame_data in active_frames:
+            spectrum = numpy.abs(numpy.fft.rfft(frame_data * window)).astype("float32")
+            spectrum = numpy.log1p(spectrum)
+            spectra.append(spectrum)
+            zcr_values.append(float(numpy.mean(numpy.abs(numpy.diff(numpy.signbit(frame_data))))))
+            weight_sum = float(numpy.sum(spectrum) + 1e-9)
+            centroid_values.append(float(numpy.sum(freqs * spectrum) / weight_sum) / max(1.0, sample_rate / 2.0))
+
+        mean_spectrum = numpy.mean(numpy.stack(spectra, axis=0), axis=0)
+        band_count = 24
+        band_edges = numpy.linspace(0, len(mean_spectrum), band_count + 1, dtype=int)
+        band_features = []
+        for start, end in zip(band_edges[:-1], band_edges[1:]):
+            if end <= start:
+                end = min(len(mean_spectrum), start + 1)
+            band_features.append(float(numpy.mean(mean_spectrum[start:end])))
+        feature = numpy.asarray(
+            band_features
+            + [
+                float(numpy.mean(rms)),
+                float(numpy.std(rms)),
+                float(numpy.mean(zcr_values)),
+                float(numpy.std(zcr_values)),
+                float(numpy.mean(centroid_values)),
+                float(numpy.std(centroid_values)),
+            ],
+            dtype="float32",
+        )
+        feature = numpy.log1p(numpy.maximum(feature, 0.0))
+        norm = float(numpy.linalg.norm(feature))
+        if norm <= 1e-9:
+            return None
+        return feature / norm
+    except Exception:
+        return None
+
+
+def _chunk_track_similarity(first: Any | None, second: Any | None) -> float:
+    if first is None or second is None:
+        return 0.0
+    try:
+        numpy = importlib.import_module("numpy")
+        return float(numpy.clip(numpy.dot(first, second), -1.0, 1.0))
+    except Exception:
+        return 0.0
+
+
+def _chunk_alignment_metrics(scores: list[float]) -> dict[str, str]:
+    if not scores:
+        return {"chunk_track_alignment": "identity_first_chunk"}
+    valid_scores = [score for score in scores if score > 0]
+    if not valid_scores:
+        return {"chunk_track_alignment": "identity_no_audio_signatures"}
+    return {
+        "chunk_track_alignment": "spectral_signature_matching",
+        "chunk_track_alignment_mean_similarity": f"{sum(valid_scores) / len(valid_scores):.3f}",
+        "chunk_track_alignment_min_similarity": f"{min(valid_scores):.3f}",
+    }
+
+
+def _run_separation_candidate(
+    candidate: str,
+    enhanced_audio_url: str,
+    transcript: list[dict],
+    *,
+    expected_speakers: int | None = None,
+) -> dict:
     source_path = _resolve_static_url(enhanced_audio_url)
+    expected_speakers = _get_expected_speaker_count(expected_speakers)
     if candidate == "gated":
-        result = build_speaker_tracks_from_transcript(enhanced_audio_url, transcript)
-        if result.get("method") == "Placeholder fallback":
-            raise RuntimeError(result.get("status", "gated track unavailable"))
-        return result
+        raise RuntimeError("gated diarization tracks are disabled for blind separation routing")
     if source_path is None or not source_path.exists():
         raise RuntimeError("Enhanced audio file not found")
+    if candidate in {"ensemble", "blind-ensemble", "blind_ensemble"}:
+        return _run_blind_ensemble_separation(source_path, enhanced_audio_url, transcript, expected_speakers)
     if candidate == "speechbrain":
         duration = get_audio_duration_seconds(source_path)
         if duration is not None and duration > _get_max_seconds():
-            return _separate_with_speechbrain_chunks(
+            result = _separate_with_speechbrain_chunks(
                 source_path,
                 f"router_speechbrain_{uuid.uuid4().hex[:8]}",
                 duration,
                 refine_tracks=False,
             )
-        return _separate_with_speechbrain(
-            source_path,
-            f"router_speechbrain_{uuid.uuid4().hex[:8]}",
-            max_seconds=_get_max_seconds(),
-            refine_tracks=False,
+        else:
+            result = _separate_with_speechbrain(
+                source_path,
+                f"router_speechbrain_{uuid.uuid4().hex[:8]}",
+                max_seconds=_get_max_seconds(),
+                refine_tracks=False,
+            )
+        return _expand_blind_tracks_to_expected_count(
+            result,
+            expected_speakers=expected_speakers,
+            output_stem=f"router_speechbrain_recursive_{uuid.uuid4().hex[:8]}",
+            split_track=lambda path, stem: _separate_speechbrain_track_for_expansion(
+                path,
+                stem,
+                model_name_override=None,
+            ),
         )
     if candidate in {"libri2mix", "speechbrain-libri2mix", "speechbrain_libri2mix"}:
         duration = get_audio_duration_seconds(source_path)
         if duration is not None and duration > _get_max_seconds():
-            return _separate_with_speechbrain_chunks(
+            result = _separate_with_speechbrain_chunks(
                 source_path,
                 f"router_libri2mix_{uuid.uuid4().hex[:8]}",
                 duration,
                 model_name_override="speechbrain/sepformer-libri2mix",
                 refine_tracks=False,
             )
-        return _separate_with_speechbrain(
-            source_path,
-            f"router_libri2mix_{uuid.uuid4().hex[:8]}",
-            max_seconds=_get_max_seconds(),
-            model_name_override="speechbrain/sepformer-libri2mix",
-            refine_tracks=False,
+        else:
+            result = _separate_with_speechbrain(
+                source_path,
+                f"router_libri2mix_{uuid.uuid4().hex[:8]}",
+                max_seconds=_get_max_seconds(),
+                model_name_override="speechbrain/sepformer-libri2mix",
+                refine_tracks=False,
+            )
+        return _expand_blind_tracks_to_expected_count(
+            result,
+            expected_speakers=expected_speakers,
+            output_stem=f"router_libri2mix_recursive_{uuid.uuid4().hex[:8]}",
+            split_track=lambda path, stem: _separate_speechbrain_track_for_expansion(
+                path,
+                stem,
+                model_name_override="speechbrain/sepformer-libri2mix",
+            ),
+        )
+    if candidate in {"resepformer", "speechbrain-resepformer", "speechbrain_resepformer"}:
+        duration = get_audio_duration_seconds(source_path)
+        model_name = "speechbrain/resepformer-wsj02mix"
+        if duration is not None and duration > _get_max_seconds():
+            result = _separate_with_speechbrain_chunks(
+                source_path,
+                f"router_resepformer_{uuid.uuid4().hex[:8]}",
+                duration,
+                model_name_override=model_name,
+                refine_tracks=False,
+            )
+        else:
+            result = _separate_with_speechbrain(
+                source_path,
+                f"router_resepformer_{uuid.uuid4().hex[:8]}",
+                max_seconds=_get_max_seconds(),
+                model_name_override=model_name,
+                refine_tracks=False,
+            )
+        return _expand_blind_tracks_to_expected_count(
+            result,
+            expected_speakers=expected_speakers,
+            output_stem=f"router_resepformer_recursive_{uuid.uuid4().hex[:8]}",
+            split_track=lambda path, stem: _separate_speechbrain_track_for_expansion(
+                path,
+                stem,
+                model_name_override=model_name,
+            ),
         )
     if candidate == "mossformer2":
-        return _run_clearvoice_mossformer2_separation(source_path, output_stem=f"router_mossformer2_{uuid.uuid4().hex[:8]}")
+        result = _run_clearvoice_mossformer2_separation(source_path, output_stem=f"router_mossformer2_{uuid.uuid4().hex[:8]}")
+        return _expand_blind_tracks_to_expected_count(
+            result,
+            expected_speakers=expected_speakers,
+            output_stem=f"router_mossformer2_recursive_{uuid.uuid4().hex[:8]}",
+            split_track=lambda path, stem: _run_clearvoice_mossformer2_separation(path, output_stem=stem),
+        )
     raise RuntimeError(f"Unsupported separation candidate: {candidate}")
+
+
+def _run_blind_ensemble_separation(
+    source_path: Path,
+    enhanced_audio_url: str,
+    transcript: list[dict],
+    expected_speakers: int | None,
+) -> dict:
+    target_count = expected_speakers or _get_recursive_blind_expansion_max_tracks()
+    target_count = min(max(2, target_count), _get_recursive_blind_expansion_max_tracks())
+    subcandidates = _get_blind_ensemble_subcandidates()
+    attempts = []
+    pool = []
+    for subcandidate in subcandidates:
+        try:
+            result = _run_separation_candidate(subcandidate, enhanced_audio_url, transcript)
+            attempts.append({"candidate": subcandidate, "status": "ok", "track_count": len(result.get("tracks", []) or [])})
+            for track in result.get("tracks", []) or []:
+                path = resolve_static_url(str(track.get("audio_url", "")))
+                if path is not None and path.exists():
+                    pool.append({"candidate": subcandidate, "track": track, "path": path})
+        except Exception as exc:
+            attempts.append({"candidate": subcandidate, "status": f"skipped:{_short_error(exc)}", "track_count": 0})
+    if len(pool) < target_count:
+        raise RuntimeError(f"Blind ensemble collected {len(pool)} tracks, below target {target_count}")
+
+    selected, metrics = _select_blind_ensemble_tracks(source_path, pool, target_count)
+    tracks = []
+    output_stem = f"router_ensemble_{uuid.uuid4().hex[:8]}"
+    for index, item in enumerate(selected, start=1):
+        output_path = UPLOAD_DIR / f"{output_stem}_speaker_{index}.wav"
+        _write_scaled_track(item["path"], output_path, float(item.get("scale", 1.0)))
+        source_track = item.get("track", {})
+        tracks.append(
+            {
+                "track_id": f"{output_stem}_speaker_{index}",
+                "label": f"分离说话人 {index}",
+                "audio_url": audio_url(output_path),
+                "description": (
+                    f"Blind ensemble selected {item.get('candidate')}::{source_track.get('track_id', index)} "
+                    f"with scale={float(item.get('scale', 1.0)):.3f}; no reference source used."
+                ),
+            }
+        )
+    return {
+        "method": f"Blind ensemble ({','.join(subcandidates)})",
+        "status": "ok-ensemble",
+        "track_count": str(len(tracks)),
+        "tracks": tracks,
+        "metrics": {
+            **metrics,
+            "blind_ensemble_attempts": "; ".join(
+                f"{item['candidate']}={item['status']}:{item['track_count']}" for item in attempts
+            ),
+            "blind_ensemble_pool_tracks": str(len(pool)),
+            "blind_ensemble_target_tracks": str(target_count),
+        },
+    }
+
+
+def _select_blind_ensemble_tracks(source_path: Path, pool: list[dict], target_count: int) -> tuple[list[dict], dict[str, str]]:
+    soundfile = importlib.import_module("soundfile")
+    numpy = importlib.import_module("numpy")
+    mixture, mixture_rate = soundfile.read(str(source_path), always_2d=True, dtype="float32")
+    mixture = mixture.mean(axis=1).astype("float32")
+    loaded = []
+    for item in pool:
+        data, track_rate = soundfile.read(str(item["path"]), always_2d=True, dtype="float32")
+        mono = data.mean(axis=1, keepdims=True).astype("float32")
+        if int(track_rate) != int(mixture_rate):
+            mono = _resample_audio_array(mono, int(track_rate), int(mixture_rate), numpy)
+        loaded.append({**item, "audio": mono[:, 0].astype("float32")})
+    mixture, *audios = _pad_mono_arrays([mixture] + [item["audio"] for item in loaded], numpy)
+    for item, audio in zip(loaded, audios):
+        item["audio"] = audio
+
+    best_score = -1e9
+    best_selection: list[dict] = []
+    best_metrics: dict[str, float] = {}
+    indexes = range(len(loaded))
+    for combo in itertools.combinations(indexes, min(target_count, len(loaded))):
+        matrix = numpy.stack([loaded[index]["audio"] for index in combo], axis=1)
+        coeffs = _positive_lstsq(matrix, mixture, numpy)
+        estimate = matrix @ coeffs
+        mix_corr = abs(_safe_correlation(estimate, mixture, numpy))
+        mixture_energy = float(numpy.mean(mixture * mixture) + 1e-9)
+        residual_ratio = float(numpy.mean((estimate - mixture) ** 2) / mixture_energy)
+        diversity = _ensemble_diversity(matrix, numpy)
+        energy_balance = _ensemble_energy_balance(matrix, coeffs, numpy)
+        score = 2.5 * mix_corr + 1.2 * diversity + 0.6 * energy_balance - 0.25 * min(4.0, residual_ratio)
+        if score > best_score:
+            best_score = score
+            best_selection = [{**loaded[index], "scale": float(coeffs[pos])} for pos, index in enumerate(combo)]
+            best_metrics = {
+                "score": score,
+                "mix_corr": mix_corr,
+                "residual_ratio": residual_ratio,
+                "diversity": diversity,
+                "energy_balance": energy_balance,
+            }
+    if not best_selection:
+        raise RuntimeError("Blind ensemble did not select any tracks")
+    return best_selection, {
+        "blind_ensemble_score": f"{best_metrics.get('score', 0.0):.3f}",
+        "blind_ensemble_mix_correlation": f"{best_metrics.get('mix_corr', 0.0):.3f}",
+        "blind_ensemble_residual_ratio": f"{best_metrics.get('residual_ratio', 0.0):.3f}",
+        "blind_ensemble_diversity": f"{best_metrics.get('diversity', 0.0):.3f}",
+        "blind_ensemble_energy_balance": f"{best_metrics.get('energy_balance', 0.0):.3f}",
+        "blind_ensemble_selected": "; ".join(
+            f"{item.get('candidate')}:{item.get('track', {}).get('track_id', index)}"
+            for index, item in enumerate(best_selection, start=1)
+        ),
+    }
+
+
+def _positive_lstsq(matrix: Any, mixture: Any, numpy: Any) -> Any:
+    try:
+        coeffs, *_ = numpy.linalg.lstsq(matrix, mixture, rcond=None)
+        coeffs = numpy.clip(coeffs.astype("float32"), 0.0, 3.0)
+        if float(numpy.sum(coeffs)) <= 1e-9:
+            coeffs = numpy.ones(matrix.shape[1], dtype="float32")
+        return coeffs
+    except Exception:
+        return numpy.ones(matrix.shape[1], dtype="float32")
+
+
+def _ensemble_diversity(matrix: Any, numpy: Any) -> float:
+    count = int(matrix.shape[1])
+    if count <= 1:
+        return 0.0
+    values = []
+    for first, second in itertools.combinations(range(count), 2):
+        values.append(abs(_safe_correlation(matrix[:, first], matrix[:, second], numpy)))
+    return float(max(0.0, 1.0 - (sum(values) / len(values) if values else 1.0)))
+
+
+def _ensemble_energy_balance(matrix: Any, coeffs: Any, numpy: Any) -> float:
+    energies = numpy.mean((matrix * coeffs.reshape(1, -1)) ** 2, axis=0) + 1e-9
+    return float(numpy.min(energies) / numpy.max(energies))
+
+
+def _write_scaled_track(input_path: Path, output_path: Path, scale: float) -> None:
+    soundfile = importlib.import_module("soundfile")
+    numpy = importlib.import_module("numpy")
+    data, sample_rate = soundfile.read(str(input_path), always_2d=True, dtype="float32")
+    output = numpy.clip(data * scale, -0.99, 0.99).astype("float32")
+    soundfile.write(str(output_path), output, int(sample_rate))
+
+
+def _separate_speechbrain_track_for_expansion(
+    source_path: Path,
+    output_stem: str,
+    *,
+    model_name_override: str | None,
+) -> dict:
+    duration = get_audio_duration_seconds(source_path)
+    if duration is not None and duration > _get_max_seconds():
+        return _separate_with_speechbrain_chunks(
+            source_path,
+            output_stem,
+            duration,
+            model_name_override=model_name_override,
+            refine_tracks=False,
+        )
+    return _separate_with_speechbrain(
+        source_path,
+        output_stem,
+        max_seconds=_get_max_seconds(),
+        model_name_override=model_name_override,
+        refine_tracks=False,
+    )
+
+
+def _expand_blind_tracks_to_expected_count(
+    result: dict,
+    *,
+    expected_speakers: int | None,
+    output_stem: str,
+    split_track,
+) -> dict:
+    tracks = list(result.get("tracks") or [])
+    if not _recursive_blind_expansion_enabled():
+        return result
+    if not expected_speakers:
+        return _expand_blind_tracks_automatically(result, output_stem=output_stem, split_track=split_track)
+    if expected_speakers <= len(tracks):
+        return result
+
+    target_count = min(expected_speakers, _get_recursive_blind_expansion_max_tracks())
+    max_steps = min(_get_recursive_blind_expansion_max_steps(), max(0, target_count - len(tracks)))
+    if target_count <= len(tracks) or max_steps <= 0:
+        return result
+
+    expansion_errors: list[str] = []
+    steps = 0
+    while len(tracks) < target_count and steps < max_steps:
+        parent_index = _select_track_for_recursive_expansion(tracks)
+        if parent_index is None:
+            break
+        parent = tracks[parent_index]
+        parent_path = resolve_static_url(str(parent.get("audio_url", "")))
+        if parent_path is None or not parent_path.exists():
+            expansion_errors.append(f"missing_parent:{parent.get('track_id', parent_index)}")
+            break
+        try:
+            child_result = split_track(parent_path, f"{output_stem}_step_{steps + 1:02d}")
+        except Exception as exc:
+            expansion_errors.append(_short_error(exc))
+            break
+        child_tracks = list(child_result.get("tracks") or [])
+        if len(child_tracks) < 2:
+            expansion_errors.append(f"child_count:{len(child_tracks)}")
+            break
+        if _get_recursive_blind_expansion_mode() == "residual_peel":
+            child_tracks = _residual_peel_child_tracks(parent, child_tracks, f"{output_stem}_step_{steps + 1:02d}")
+        annotated_children = []
+        for child_index, child in enumerate(child_tracks, start=1):
+            annotated_children.append(
+                {
+                    **child,
+                    "track_id": f"{output_stem}_expanded_{steps + 1:02d}_{child_index}",
+                    "label": f"分离说话人 {parent_index + child_index}",
+                    "description": (
+                        f"{child.get('description', '')} Recursive blind split from "
+                        f"{parent.get('track_id', parent_index)}; no reference source used."
+                    ),
+                }
+            )
+        tracks[parent_index : parent_index + 1] = annotated_children
+        steps += 1
+
+    if steps <= 0:
+        metrics = {
+            **result.get("metrics", {}),
+            "recursive_blind_expansion": "skipped_no_successful_split",
+        }
+        if expansion_errors:
+            metrics["recursive_blind_expansion_error"] = "; ".join(expansion_errors[:3])
+        return {**result, "metrics": metrics}
+
+    tracks = tracks[:target_count]
+    for index, track in enumerate(tracks, start=1):
+        track["label"] = f"分离说话人 {index}"
+    metrics = {
+        **result.get("metrics", {}),
+        "recursive_blind_expansion": "applied",
+        "recursive_blind_expansion_mode": _get_recursive_blind_expansion_mode(),
+        "recursive_blind_expansion_target_tracks": str(target_count),
+        "recursive_blind_expansion_steps": str(steps),
+    }
+    if expansion_errors:
+        metrics["recursive_blind_expansion_error"] = "; ".join(expansion_errors[:3])
+    return {
+        **result,
+        "status": f"{result.get('status', 'ok')}-recursive",
+        "method": f"{result.get('method', 'Blind separation')} + recursive blind expansion",
+        "track_count": str(len(tracks)),
+        "tracks": tracks,
+        "metrics": metrics,
+    }
+
+
+def _expand_blind_tracks_automatically(result: dict, *, output_stem: str, split_track) -> dict:
+    tracks = list(result.get("tracks") or [])
+    track_depths = [0 for _track in tracks]
+    target_count = min(_get_auto_recursive_blind_expansion_max_tracks(), _get_recursive_blind_expansion_max_tracks())
+    max_steps = min(_get_recursive_blind_expansion_max_steps(), max(0, target_count - len(tracks)))
+    if target_count <= len(tracks) or max_steps <= 0:
+        return result
+
+    expansion_errors: list[str] = []
+    decisions: list[str] = []
+    steps = 0
+    while len(tracks) < target_count and steps < max_steps:
+        candidates = _rank_tracks_for_recursive_expansion(tracks, track_depths=track_depths)
+        accepted = False
+        if not candidates:
+            break
+        for parent_index, _score in candidates:
+            parent = tracks[parent_index]
+            parent_path = resolve_static_url(str(parent.get("audio_url", "")))
+            if parent_path is None or not parent_path.exists():
+                expansion_errors.append(f"missing_parent:{parent.get('track_id', parent_index)}")
+                continue
+            try:
+                child_result = split_track(parent_path, f"{output_stem}_auto_{steps + 1:02d}_{parent_index + 1}")
+            except Exception as exc:
+                expansion_errors.append(_short_error(exc))
+                continue
+            child_tracks = list(child_result.get("tracks") or [])
+            if len(child_tracks) < 2:
+                expansion_errors.append(f"child_count:{len(child_tracks)}")
+                continue
+            if _get_recursive_blind_expansion_mode() == "residual_peel":
+                child_tracks = _residual_peel_child_tracks(parent, child_tracks, f"{output_stem}_auto_{steps + 1:02d}")
+            decision = _score_recursive_split(parent_path, child_tracks)
+            decisions.append(_format_recursive_split_decision(parent, decision))
+            if not decision["accepted"]:
+                continue
+            annotated_children = []
+            for child_index, child in enumerate(child_tracks[:2], start=1):
+                annotated_children.append(
+                    {
+                        **child,
+                        "track_id": f"{output_stem}_auto_expanded_{steps + 1:02d}_{child_index}",
+                        "label": f"鍒嗙璇磋瘽浜?{parent_index + child_index}",
+                        "description": (
+                            f"{child.get('description', '')} Auto recursive blind split from "
+                            f"{parent.get('track_id', parent_index)}; no expected speaker count or reference source used."
+                        ),
+                    }
+                )
+            tracks[parent_index : parent_index + 1] = annotated_children
+            child_depth = track_depths[parent_index] + 1
+            track_depths[parent_index : parent_index + 1] = [child_depth for _child in annotated_children]
+            steps += 1
+            accepted = True
+            break
+        if not accepted:
+            break
+
+    if steps <= 0:
+        metrics = {
+            **result.get("metrics", {}),
+            "recursive_blind_expansion": "auto_skipped_no_confident_split",
+            "recursive_blind_expansion_mode": _get_recursive_blind_expansion_mode(),
+        }
+        if decisions:
+            metrics["recursive_blind_expansion_auto_decisions"] = "; ".join(decisions[:4])
+        if expansion_errors:
+            metrics["recursive_blind_expansion_error"] = "; ".join(expansion_errors[:3])
+        return {**result, "metrics": metrics}
+
+    for index, track in enumerate(tracks, start=1):
+        track["label"] = f"鍒嗙璇磋瘽浜?{index}"
+    metrics = {
+        **result.get("metrics", {}),
+        "recursive_blind_expansion": "auto_applied",
+        "recursive_blind_expansion_mode": _get_recursive_blind_expansion_mode(),
+        "recursive_blind_expansion_target_tracks": "auto",
+        "recursive_blind_expansion_auto_max_tracks": str(target_count),
+        "recursive_blind_expansion_auto_max_depth": str(_get_auto_recursive_blind_expansion_max_depth()),
+        "recursive_blind_expansion_steps": str(steps),
+    }
+    if decisions:
+        metrics["recursive_blind_expansion_auto_decisions"] = "; ".join(decisions[:4])
+    if expansion_errors:
+        metrics["recursive_blind_expansion_error"] = "; ".join(expansion_errors[:3])
+    return {
+        **result,
+        "status": f"{result.get('status', 'ok')}-auto-recursive",
+        "method": f"{result.get('method', 'Blind separation')} + auto recursive blind expansion",
+        "track_count": str(len(tracks)),
+        "tracks": tracks,
+        "metrics": metrics,
+    }
+
+
+def _rank_tracks_for_recursive_expansion(tracks: list[dict], track_depths: list[int] | None = None) -> list[tuple[int, float]]:
+    scored = []
+    for index, track in enumerate(tracks):
+        if track_depths is not None and index < len(track_depths):
+            if track_depths[index] >= _get_auto_recursive_blind_expansion_max_depth():
+                continue
+        path = resolve_static_url(str(track.get("audio_url", "")))
+        if path is None or not path.exists():
+            continue
+        score = (
+            _track_complexity_score(path)
+            if _get_recursive_parent_selection_policy() == "complexity"
+            else _track_rms_energy(path)
+        )
+        scored.append((index, score))
+    scored.sort(key=lambda item: item[1], reverse=True)
+    return scored
+
+
+def _score_recursive_split(parent_path: Path, child_tracks: list[dict]) -> dict[str, float | bool]:
+    child_paths = [
+        resolve_static_url(str(child.get("audio_url", "")))
+        for child in child_tracks[:2]
+    ]
+    child_paths = [path for path in child_paths if path is not None and path.exists()]
+    if len(child_paths) < 2:
+        return {"accepted": False, "quality": 0.0, "energy_balance": 0.0, "active_min": 0.0, "child_correlation": 1.0}
+    try:
+        soundfile = importlib.import_module("soundfile")
+        numpy = importlib.import_module("numpy")
+        parent, parent_rate = soundfile.read(str(parent_path), always_2d=True, dtype="float32")
+        parent_mono = parent.mean(axis=1).astype("float32")
+        child_arrays = []
+        for child_path in child_paths:
+            data, child_rate = soundfile.read(str(child_path), always_2d=True, dtype="float32")
+            mono = data.mean(axis=1, keepdims=True).astype("float32")
+            if int(child_rate) != int(parent_rate):
+                mono = _resample_audio_array(mono, int(child_rate), int(parent_rate), numpy)
+            child_arrays.append(mono[:, 0].astype("float32"))
+        parent_mono, first, second = _pad_mono_arrays([parent_mono, child_arrays[0], child_arrays[1]], numpy)
+        first_energy = float(numpy.mean(first * first) + 1e-9)
+        second_energy = float(numpy.mean(second * second) + 1e-9)
+        energy_balance = min(first_energy, second_energy) / max(first_energy, second_energy)
+        active_ratios = [
+            _track_active_ratio(first, int(parent_rate), numpy),
+            _track_active_ratio(second, int(parent_rate), numpy),
+        ]
+        active_min = min(active_ratios)
+        child_correlation = abs(_safe_correlation(first, second, numpy))
+        parent_correlation = max(0.0, _safe_correlation(first + second, parent_mono, numpy))
+        quality = (
+            0.45 * min(1.0, energy_balance)
+            + 0.30 * min(1.0, active_min)
+            + 0.15 * parent_correlation
+            + 0.10 * max(0.0, 1.0 - min(1.0, child_correlation))
+        )
+        accepted = (
+            quality >= _get_auto_recursive_min_quality()
+            and energy_balance >= _get_auto_recursive_min_energy_balance()
+            and active_min >= _get_auto_recursive_min_active_ratio()
+            and child_correlation <= _get_auto_recursive_max_child_correlation()
+        )
+        return {
+            "accepted": bool(accepted),
+            "quality": float(quality),
+            "energy_balance": float(energy_balance),
+            "active_min": float(active_min),
+            "child_correlation": float(child_correlation),
+            "parent_correlation": float(parent_correlation),
+        }
+    except Exception:
+        return {"accepted": False, "quality": 0.0, "energy_balance": 0.0, "active_min": 0.0, "child_correlation": 1.0}
+
+
+def _track_active_ratio(samples: Any, sample_rate: int, numpy: Any) -> float:
+    rms = _frame_rms(samples, sample_rate, numpy)
+    if len(rms) == 0:
+        return 0.0
+    threshold = max(1e-5, float(numpy.percentile(rms, 95)) * 0.08)
+    return float(numpy.mean(rms >= threshold))
+
+
+def _format_recursive_split_decision(parent: dict, decision: dict[str, float | bool]) -> str:
+    status = "accept" if decision.get("accepted") else "reject"
+    return (
+        f"{parent.get('track_id', 'track')}:{status}"
+        f"/q={float(decision.get('quality', 0.0)):.3f}"
+        f"/bal={float(decision.get('energy_balance', 0.0)):.3f}"
+        f"/act={float(decision.get('active_min', 0.0)):.3f}"
+        f"/corr={float(decision.get('child_correlation', 0.0)):.3f}"
+    )
+
+
+def _residual_peel_child_tracks(parent: dict, child_tracks: list[dict], output_stem: str) -> list[dict]:
+    parent_path = resolve_static_url(str(parent.get("audio_url", "")))
+    child_paths = [
+        resolve_static_url(str(child.get("audio_url", "")))
+        for child in child_tracks
+    ]
+    available = [(index, path) for index, path in enumerate(child_paths) if path is not None and path.exists()]
+    if parent_path is None or not parent_path.exists() or len(available) < 2:
+        return child_tracks
+    chooser = max if _get_recursive_peel_child_policy() == "high_energy" else min
+    peel_index = chooser(available, key=lambda item: _track_rms_energy(item[1]))[0]
+    peel_track = dict(child_tracks[peel_index])
+    peel_path = child_paths[peel_index]
+    if peel_path is None:
+        return child_tracks
+    try:
+        residual_path = UPLOAD_DIR / f"{output_stem}_residual.wav"
+        _write_residual_track(parent_path, peel_path, residual_path)
+    except Exception:
+        return child_tracks
+    peel_track["description"] = f"{peel_track.get('description', '')} Recursive residual-peel selected source."
+    return [
+        peel_track,
+        {
+            "track_id": f"{output_stem}_residual",
+            "label": "remaining blind mixture",
+            "audio_url": audio_url(residual_path),
+            "description": (
+                "Recursive residual-peel remaining mixture from parent minus selected blind source; "
+                "no reference source used."
+            ),
+        },
+    ]
+
+
+def _write_residual_track(parent_path: Path, child_path: Path, output_path: Path) -> None:
+    soundfile = importlib.import_module("soundfile")
+    numpy = importlib.import_module("numpy")
+    parent, parent_rate = soundfile.read(str(parent_path), always_2d=True, dtype="float32")
+    child, child_rate = soundfile.read(str(child_path), always_2d=True, dtype="float32")
+    if int(child_rate) != int(parent_rate):
+        child = _resample_audio_array(child, int(child_rate), int(parent_rate), numpy)
+    channels = int(parent.shape[1])
+    if child.shape[1] != channels:
+        child = child.mean(axis=1, keepdims=True)
+        if channels > 1:
+            child = numpy.repeat(child, channels, axis=1)
+    target_len = max(len(parent), len(child))
+    parent = _pad_audio_array(parent, target_len, channels, numpy)
+    child = _pad_audio_array(child, target_len, channels, numpy)
+    denom = float(numpy.sum(child * child) + 1e-9)
+    scale = float(numpy.sum(parent * child) / denom)
+    residual = numpy.clip(parent - scale * child, -0.99, 0.99).astype("float32")
+    soundfile.write(str(output_path), residual[: len(parent)], int(parent_rate))
+
+
+def _select_track_for_recursive_expansion(tracks: list[dict]) -> int | None:
+    if not tracks:
+        return None
+    scored = []
+    for index, track in enumerate(tracks):
+        path = resolve_static_url(str(track.get("audio_url", "")))
+        if path is None or not path.exists():
+            continue
+        score = (
+            _track_complexity_score(path)
+            if _get_recursive_parent_selection_policy() == "complexity"
+            else _track_rms_energy(path)
+        )
+        scored.append((index, score))
+    if not scored:
+        return None
+    scored.sort(key=lambda item: item[1], reverse=True)
+    return scored[0][0]
+
+
+def _track_complexity_score(path: Path) -> float:
+    try:
+        soundfile = importlib.import_module("soundfile")
+        numpy = importlib.import_module("numpy")
+        data, sample_rate = soundfile.read(str(path), always_2d=True, dtype="float32")
+        if len(data) == 0:
+            return 0.0
+        mono = data.mean(axis=1).astype("float32")
+        rms = _frame_rms_custom(mono, max(256, int(sample_rate * 0.032)), max(128, int(sample_rate * 0.016)), numpy)
+        active_threshold = max(1e-5, float(numpy.percentile(rms, 75)) * 0.25)
+        active_ratio = float(numpy.mean(rms >= active_threshold)) if len(rms) else 0.0
+        frame = max(512, int(sample_rate * 0.064))
+        hop = max(128, frame // 2)
+        if len(mono) < frame:
+            return _track_rms_energy(path) * (1.0 + active_ratio)
+        window = numpy.hanning(frame).astype("float32")
+        entropies = []
+        for start in range(0, len(mono) - frame + 1, hop):
+            chunk = mono[start : start + frame]
+            spectrum = numpy.abs(numpy.fft.rfft(chunk * window)).astype("float32")
+            total = float(numpy.sum(spectrum) + 1e-9)
+            prob = spectrum / total
+            entropy = -float(numpy.sum(prob * numpy.log(prob + 1e-9)) / numpy.log(len(prob)))
+            entropies.append(entropy)
+        spectral_entropy = float(numpy.mean(entropies)) if entropies else 0.0
+        return _track_rms_energy(path) * (1.0 + active_ratio + spectral_entropy)
+    except Exception:
+        return _track_rms_energy(path)
+
+
+def _track_rms_energy(path: Path) -> float:
+    try:
+        soundfile = importlib.import_module("soundfile")
+        numpy = importlib.import_module("numpy")
+        data, _sample_rate = soundfile.read(str(path), always_2d=True, dtype="float32")
+        if len(data) == 0:
+            return 0.0
+        mono = data.mean(axis=1).astype("float32")
+        return float(numpy.sqrt(numpy.mean(mono * mono) + 1e-12))
+    except Exception:
+        return 0.0
 
 
 def _run_clearvoice_mossformer2_separation(source_path: Path, output_stem: str) -> dict:
@@ -463,8 +1242,11 @@ def _score_separation_result(
         score += 4
     if "libri2mix" in method:
         score += _get_libri2mix_candidate_bonus()
-    if "gated" in method:
-        score += 2
+    if "resepformer" in method and expected_speakers:
+        if expected_speakers == 3:
+            score += _get_resepformer_multispeaker_bonus()
+        elif expected_speakers >= 4:
+            score += min(1.0, _get_resepformer_multispeaker_bonus())
     if expected_speakers and expected_speakers > 1 and len(tracks) < expected_speakers:
         missing_ratio = (expected_speakers - len(tracks)) / expected_speakers
         score -= 45.0 * missing_ratio
@@ -489,18 +1271,27 @@ def _refine_selected_speechbrain_candidate(selected: dict, source_url: str) -> N
 
 
 def _is_speechbrain_candidate(candidate: str) -> bool:
-    return candidate in {"speechbrain", "libri2mix", "speechbrain-libri2mix", "speechbrain_libri2mix"}
+    return candidate in {
+        "speechbrain",
+        "libri2mix",
+        "speechbrain-libri2mix",
+        "speechbrain_libri2mix",
+        "resepformer",
+        "speechbrain-resepformer",
+        "speechbrain_resepformer",
+    }
 
 
 def _annotate_separation_result(result: dict, candidate: str, score: float) -> dict:
     tracks = []
-    for track in result.get("tracks", []):
+    for index, track in enumerate(result.get("tracks", []), start=1):
+        label = _speaker_letter_label(index)
         tracks.append(
             {
                 **track,
+                "label": label,
                 "description": (
-                    f"{track.get('description', '')} Quality-aware separation candidate={candidate}, "
-                    f"score={score:.1f}."
+                    f"{label} 的分离音轨。Quality-aware separation candidate={candidate}, score={score:.1f}."
                 ),
             }
         )
@@ -508,6 +1299,12 @@ def _annotate_separation_result(result: dict, candidate: str, score: float) -> d
         **result,
         "tracks": tracks,
     }
+
+
+def _speaker_letter_label(index: int) -> str:
+    if 1 <= index <= 26:
+        return f"说话人 {chr(ord('A') + index - 1)}"
+    return f"说话人 {index}"
 
 
 def _separation_candidate_metrics(attempts: list[dict], selected: str) -> dict[str, str]:
@@ -1222,12 +2019,142 @@ def _get_max_chunks() -> int:
 
 
 def _get_separation_candidates() -> list[str]:
-    raw = os.getenv("SEPARATION_CANDIDATES", "libri2mix,mossformer2,gated").strip()
+    raw = os.getenv("SEPARATION_CANDIDATES", "libri2mix,mossformer2,resepformer").strip()
     candidates = [item.strip().lower() for item in raw.split(",") if item.strip()]
-    return candidates or ["gated"]
+    blind_candidates = [candidate for candidate in candidates if candidate != "gated"]
+    return blind_candidates or ["libri2mix", "mossformer2", "resepformer"]
 
 
-def _get_expected_speaker_count(transcript: list[dict]) -> int | None:
+def _get_chunk_alignment_similarity_floor() -> float:
+    raw = os.getenv(
+        "SEPARATION_CHUNK_ALIGNMENT_SIMILARITY_FLOOR",
+        str(DEFAULT_CHUNK_ALIGNMENT_SIMILARITY_FLOOR),
+    ).strip()
+    try:
+        value = float(raw)
+    except ValueError:
+        return DEFAULT_CHUNK_ALIGNMENT_SIMILARITY_FLOOR
+    return min(1.0, max(-1.0, value))
+
+
+def _recursive_blind_expansion_enabled() -> bool:
+    return os.getenv("SEPARATION_RECURSIVE_EXPANSION", "true").strip().lower() not in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }
+
+
+def _get_recursive_blind_expansion_max_tracks() -> int:
+    raw = os.getenv("SEPARATION_RECURSIVE_MAX_TRACKS", str(DEFAULT_RECURSIVE_MAX_TRACKS)).strip()
+    try:
+        value = int(raw)
+    except ValueError:
+        return DEFAULT_RECURSIVE_MAX_TRACKS
+    return max(2, min(12, value))
+
+
+def _get_auto_recursive_blind_expansion_max_tracks() -> int:
+    raw = os.getenv("SEPARATION_AUTO_RECURSIVE_MAX_TRACKS", str(DEFAULT_AUTO_RECURSIVE_MAX_TRACKS)).strip()
+    try:
+        value = int(raw)
+    except ValueError:
+        return DEFAULT_AUTO_RECURSIVE_MAX_TRACKS
+    return max(2, min(12, value))
+
+
+def _get_auto_recursive_blind_expansion_max_depth() -> int:
+    raw = os.getenv("SEPARATION_AUTO_RECURSIVE_MAX_DEPTH", str(DEFAULT_AUTO_RECURSIVE_MAX_DEPTH)).strip()
+    try:
+        value = int(raw)
+    except ValueError:
+        return DEFAULT_AUTO_RECURSIVE_MAX_DEPTH
+    return max(0, min(8, value))
+
+
+def _get_recursive_blind_expansion_max_steps() -> int:
+    raw = os.getenv("SEPARATION_RECURSIVE_MAX_STEPS", str(DEFAULT_RECURSIVE_MAX_STEPS)).strip()
+    try:
+        value = int(raw)
+    except ValueError:
+        return DEFAULT_RECURSIVE_MAX_STEPS
+    return max(0, min(12, value))
+
+
+def _get_recursive_blind_expansion_mode() -> str:
+    mode = os.getenv("SEPARATION_RECURSIVE_MODE", DEFAULT_RECURSIVE_MODE).strip().lower()
+    if mode in {"residual", "residual_peel", "peel"}:
+        return "residual_peel"
+    return "direct_split"
+
+
+def _get_recursive_peel_child_policy() -> str:
+    value = os.getenv("SEPARATION_RECURSIVE_PEEL_CHILD", "low_energy").strip().lower()
+    return "high_energy" if value in {"high", "high_energy", "loud"} else "low_energy"
+
+
+def _get_recursive_parent_selection_policy() -> str:
+    value = os.getenv("SEPARATION_RECURSIVE_PARENT_SELECTION", "complexity").strip().lower()
+    return "energy" if value in {"energy", "rms", "loudest"} else "complexity"
+
+
+def _get_auto_recursive_min_energy_balance() -> float:
+    raw = os.getenv(
+        "SEPARATION_AUTO_RECURSIVE_MIN_ENERGY_BALANCE",
+        str(DEFAULT_AUTO_RECURSIVE_MIN_ENERGY_BALANCE),
+    ).strip()
+    try:
+        value = float(raw)
+    except ValueError:
+        return DEFAULT_AUTO_RECURSIVE_MIN_ENERGY_BALANCE
+    return max(0.0, min(1.0, value))
+
+
+def _get_auto_recursive_min_active_ratio() -> float:
+    raw = os.getenv(
+        "SEPARATION_AUTO_RECURSIVE_MIN_ACTIVE_RATIO",
+        str(DEFAULT_AUTO_RECURSIVE_MIN_ACTIVE_RATIO),
+    ).strip()
+    try:
+        value = float(raw)
+    except ValueError:
+        return DEFAULT_AUTO_RECURSIVE_MIN_ACTIVE_RATIO
+    return max(0.0, min(1.0, value))
+
+
+def _get_auto_recursive_max_child_correlation() -> float:
+    raw = os.getenv(
+        "SEPARATION_AUTO_RECURSIVE_MAX_CHILD_CORRELATION",
+        str(DEFAULT_AUTO_RECURSIVE_MAX_CHILD_CORRELATION),
+    ).strip()
+    try:
+        value = float(raw)
+    except ValueError:
+        return DEFAULT_AUTO_RECURSIVE_MAX_CHILD_CORRELATION
+    return max(0.0, min(1.0, value))
+
+
+def _get_auto_recursive_min_quality() -> float:
+    raw = os.getenv("SEPARATION_AUTO_RECURSIVE_MIN_QUALITY", str(DEFAULT_AUTO_RECURSIVE_MIN_QUALITY)).strip()
+    try:
+        value = float(raw)
+    except ValueError:
+        return DEFAULT_AUTO_RECURSIVE_MIN_QUALITY
+    return max(0.0, min(1.0, value))
+
+
+def _get_blind_ensemble_subcandidates() -> list[str]:
+    raw = os.getenv("SEPARATION_ENSEMBLE_CANDIDATES", "resepformer,libri2mix,mossformer2").strip()
+    candidates = [item.strip().lower() for item in raw.split(",") if item.strip()]
+    return [item for item in candidates if item not in {"ensemble", "blind-ensemble", "blind_ensemble", "gated"}] or [
+        "resepformer",
+        "libri2mix",
+        "mossformer2",
+    ]
+
+
+def _get_expected_speaker_count(expected_speakers_hint: int | None = None) -> int | None:
     for name in ("SEPARATION_EXPECTED_SPEAKERS", "SEPARATION_MIN_TRACKS"):
         raw = os.getenv(name, "").strip()
         if not raw:
@@ -1239,8 +2166,10 @@ def _get_expected_speaker_count(transcript: list[dict]) -> int | None:
         if value > 1:
             return value
 
-    speaker_count = len(_speaker_intervals(transcript))
-    return speaker_count if speaker_count > 1 else None
+    if expected_speakers_hint and expected_speakers_hint > 1:
+        return expected_speakers_hint
+
+    return None
 
 
 def _transcript_overlap_ratio(transcript: list[dict]) -> float:
@@ -1330,6 +2259,10 @@ def _get_mossformer_diagnostic_bonus() -> float:
 
 def _get_libri2mix_candidate_bonus() -> float:
     return _get_float_env("SEPARATION_LIBRI2MIX_BONUS", 1.5, minimum=-20.0, maximum=20.0)
+
+
+def _get_resepformer_multispeaker_bonus() -> float:
+    return _get_float_env("SEPARATION_RESEPFORMER_MULTISPEAKER_BONUS", 4.0, minimum=-20.0, maximum=20.0)
 
 
 def _quality_router_enabled() -> bool:
@@ -1435,63 +2368,6 @@ def _speaker_intervals(transcript: list[dict]) -> dict[str, list[tuple[float, fl
     return {speaker: _merge_intervals(intervals) for speaker, intervals in grouped.items()}
 
 
-def _write_gated_speaker_tracks(source_path: Path, intervals: dict[str, list[tuple[float, float]]]) -> list[dict]:
-    soundfile = importlib.import_module("soundfile")
-    numpy = importlib.import_module("numpy")
-    data, sample_rate = soundfile.read(str(source_path), always_2d=True, dtype="float32")
-    if len(data) == 0 or sample_rate <= 0:
-        raise RuntimeError("Source audio is empty")
-
-    tracks = []
-    background_gain = _get_gated_background_gain()
-    target_gain = _get_gated_target_gain()
-    limiter = _get_gated_limiter()
-    fade_samples = int(sample_rate * _get_gated_fade_ms() / 1000.0)
-    for index, (speaker, speaker_intervals) in enumerate(sorted(intervals.items()), start=1):
-        gains = numpy.full((len(data), 1), background_gain, dtype="float32")
-        for start, end in speaker_intervals:
-            start_sample = max(0, min(len(data), int(start * sample_rate)))
-            end_sample = max(start_sample, min(len(data), int(end * sample_rate)))
-            if end_sample > start_sample:
-                _apply_speaker_gain_window(gains, start_sample, end_sample, background_gain, target_gain, fade_samples)
-        output = numpy.clip(data * gains, -limiter, limiter)
-
-        safe_label = _safe_filename(speaker)
-        output_path = UPLOAD_DIR / f"{source_path.stem}_{safe_label}_diarized.wav"
-        soundfile.write(str(output_path), output, sample_rate)
-        speech_seconds = sum(max(0.0, end - start) for start, end in speaker_intervals)
-        background_db = _gain_to_db(background_gain)
-        target_db = _gain_to_db(target_gain)
-        tracks.append(
-            {
-                "track_id": f"{source_path.stem}_{safe_label}",
-                "label": speaker,
-                "audio_url": audio_url(output_path),
-                "description": (
-                    "FunASR speaker diarization gated track: "
-                    f"突出{speaker}时间段({target_db:+.1f} dB)，"
-                    f"其他说话人区域强衰减({background_db:.1f} dB)，讲话约{speech_seconds:.0f}s。"
-                ),
-            }
-        )
-    return tracks
-
-
-def _apply_speaker_gain_window(gains, start: int, end: int, background_gain: float, target_gain: float, fade_samples: int) -> None:
-    gains[start:end, :] = target_gain
-    if fade_samples <= 0:
-        return
-    numpy = importlib.import_module("numpy")
-    segment_len = max(0, end - start)
-    fade_len = min(fade_samples, max(1, segment_len // 2))
-    if fade_len <= 1:
-        return
-    fade_in = numpy.linspace(background_gain, target_gain, fade_len, dtype="float32").reshape(-1, 1)
-    fade_out = numpy.linspace(target_gain, background_gain, fade_len, dtype="float32").reshape(-1, 1)
-    gains[start : start + fade_len, :] = fade_in
-    gains[end - fade_len : end, :] = fade_out
-
-
 def _parse_timestamp(value: Any) -> float:
     if isinstance(value, (int, float)):
         return float(value)
@@ -1530,48 +2406,6 @@ def _stable_speaker_label(raw_speaker: str, index: int) -> str:
 def _safe_filename(value: str) -> str:
     cleaned = "".join(ch if ch.isalnum() else "_" for ch in value).strip("_")
     return cleaned or "speaker"
-
-
-def _get_gated_background_gain() -> float:
-    raw = os.getenv("SPEAKER_TRACK_BACKGROUND_GAIN", "0.015").strip()
-    try:
-        value = float(raw)
-    except ValueError:
-        return 0.015
-    return min(0.5, max(0.0, value))
-
-
-def _get_gated_target_gain() -> float:
-    raw = os.getenv("SPEAKER_TRACK_TARGET_GAIN", "1.25").strip()
-    try:
-        value = float(raw)
-    except ValueError:
-        return 1.25
-    return min(2.0, max(0.1, value))
-
-
-def _get_gated_fade_ms() -> float:
-    raw = os.getenv("SPEAKER_TRACK_FADE_MS", "25").strip()
-    try:
-        value = float(raw)
-    except ValueError:
-        return 25.0
-    return min(250.0, max(0.0, value))
-
-
-def _get_gated_limiter() -> float:
-    raw = os.getenv("SPEAKER_TRACK_LIMIT", "0.98").strip()
-    try:
-        value = float(raw)
-    except ValueError:
-        return 0.98
-    return min(1.0, max(0.1, value))
-
-
-def _gain_to_db(gain: float) -> float:
-    if gain <= 0:
-        return -120.0
-    return 20.0 * math.log10(gain)
 
 
 def _trim_sources(sources: Any, max_seconds: float) -> Any:

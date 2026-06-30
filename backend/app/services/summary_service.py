@@ -8,12 +8,13 @@ from pathlib import Path
 from typing import Any
 
 import httpx
-from dotenv import load_dotenv
+
+from ..env_loader import load_backend_env
 
 
 SUMMARY_FIELDS = ("title", "keywords", "abstract", "decisions", "action_items")
 BACKEND_DIR = Path(__file__).resolve().parents[2]
-load_dotenv(BACKEND_DIR / ".env")
+load_backend_env(BACKEND_DIR)
 
 DEFAULT_BASE_URL = "https://api.deepseek.com/v1"
 DEFAULT_MODEL = "deepseek-chat"

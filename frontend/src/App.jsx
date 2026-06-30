@@ -1,9 +1,8 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
-import { AudioWaveform, FolderOpen, Loader2, Play, Upload } from "lucide-react";
+import { AudioWaveform, Loader2, Play, Upload } from "lucide-react";
 import {
   fetchDemoCases,
   processDemo,
-  processLocalFile,
   uploadAudioFile,
 } from "./api";
 import { AudioCompare } from "./components/AudioCompare";
@@ -19,7 +18,7 @@ export function App() {
   const [result, setResult] = useState(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
-  const [localPath, setLocalPath] = useState("");
+  const [processingMode, setProcessingMode] = useState("fast");
   const [uploadProgress, setUploadProgress] = useState(null);
   const uploadRef = useRef(null);
 
@@ -40,7 +39,7 @@ export function App() {
 
   async function runDemo(caseId = selectedCase) {
     if (!caseId) return;
-    await runTask(() => processDemo(caseId), "样例处理失败，请检查后端服务。");
+    await runTask(() => processDemo(caseId, processingMode), "样例处理失败，请检查后端服务。");
   }
 
   async function uploadAudio(event) {
@@ -48,22 +47,13 @@ export function App() {
     if (!file) return;
     await runTask(
       () =>
-        uploadAudioFile(file, (progress) => {
+        uploadAudioFile(file, processingMode, (progress) => {
           setUploadProgress(progress);
         }),
       "上传处理失败，请检查音频格式或后端服务。",
     );
     setUploadProgress(null);
     event.target.value = "";
-  }
-
-  async function runLocalFile() {
-    const path = localPath.trim();
-    if (!path) {
-      setError("请先粘贴本地音频文件路径。");
-      return;
-    }
-    await runTask(() => processLocalFile(path), "本地文件处理失败，请检查路径是否存在，或后端服务是否已启动。");
   }
 
   async function runTask(task, message) {
@@ -83,6 +73,7 @@ export function App() {
       <CommandHeader
         currentCase={currentCase}
         loading={loading}
+        processingMode={processingMode}
         resultStats={resultStats}
         selectedCase={selectedCase}
         onRunDemo={() => runDemo()}
@@ -95,10 +86,9 @@ export function App() {
           cases={cases}
           currentCase={currentCase}
           loading={loading}
-          localPath={localPath}
+          processingMode={processingMode}
           selectedCase={selectedCase}
-          onLocalPathChange={setLocalPath}
-          onProcessLocalFile={runLocalFile}
+          onProcessingModeChange={setProcessingMode}
           onSelectCase={setSelectedCase}
         />
 
@@ -122,7 +112,7 @@ export function App() {
   );
 }
 
-function CommandHeader({ currentCase, loading, resultStats, selectedCase, onRunDemo, uploadRef }) {
+function CommandHeader({ currentCase, loading, processingMode, resultStats, selectedCase, onRunDemo, uploadRef }) {
   return (
     <section className="command-header">
       <div className="brand-lockup">
@@ -135,6 +125,7 @@ function CommandHeader({ currentCase, loading, resultStats, selectedCase, onRunD
           <div className="case-meta">
             <span>{currentCase?.name || "等待后端样例"}</span>
             <span>{currentCase?.noise_level || "状态"} / {currentCase?.duration || "未运行"}</span>
+            <span>{processingMode === "fast" ? "分离快评" : "完整流程"}</span>
           </div>
         </div>
       </div>
@@ -164,10 +155,9 @@ function Sidebar({
   cases,
   currentCase,
   loading,
-  localPath,
+  processingMode,
   selectedCase,
-  onLocalPathChange,
-  onProcessLocalFile,
+  onProcessingModeChange,
   onSelectCase,
 }) {
   return (
@@ -185,26 +175,31 @@ function Sidebar({
           >
             <span>{item.name}</span>
             <small>{item.scene}</small>
-            <strong>{item.noise_level}噪声 / {item.duration}</strong>
+            <strong>{item.noise_level} / {item.duration}</strong>
           </button>
         ))}
       </div>
-      <div className="local-file-box">
-        <label>
-          <FolderOpen size={16} />
-          本地大文件路径
-        </label>
-        <div className="local-file-row">
-          <input
-            value={localPath}
-            onChange={(event) => onLocalPathChange(event.target.value)}
-            placeholder="C:\\workshop\\...\\meeting.flac"
+      <div className="mode-box">
+        <span className="mode-label">处理路径</span>
+        <div className="mode-toggle" role="group" aria-label="处理路径">
+          <button
+            className={processingMode === "fast" ? "active" : ""}
+            onClick={() => onProcessingModeChange("fast")}
             disabled={loading}
-          />
-          <button className="secondary-action" onClick={onProcessLocalFile} disabled={loading || !localPath.trim()}>
-            处理本地文件
+            type="button"
+          >
+            分离快评
+          </button>
+          <button
+            className={processingMode === "full" ? "active" : ""}
+            onClick={() => onProcessingModeChange("full")}
+            disabled={loading}
+            type="button"
+          >
+            完整流程
           </button>
         </div>
+        <p>{processingMode === "fast" ? "只跑 quality router 模型分离快评，跳过 ASR 与摘要。" : "跑增强、ASR、分离、摘要等完整链路。"}</p>
       </div>
       {currentCase && <p className="case-note">{currentCase.description}</p>}
     </aside>
