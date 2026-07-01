@@ -8,9 +8,9 @@
 会议音频上传
 -> 音频标准化
 -> 语音增强
--> 最佳分离路径：Libri2Mix SepFormer / ClearVoice MossFormer2 质量路由
--> 兜底路径：placeholder 轨道
 -> ASR 转写
+-> 最佳分离路径：Libri2Mix SepFormer / ClearVoice MossFormer2 / ReSepFormer 质量路由
+-> ASR 片段与分离轨道对齐
 -> 主题整理与会议摘要
 -> 前端试听、转写和摘要展示
 ```
@@ -92,6 +92,7 @@ frontend/
   src/components/             音频试听、转写、摘要和诊断组件
 
 docs/
+  PIPELINE.md                 新音频完整数据链路
   ENHANCEMENT.md              语音增强模块说明
   SEPARATION.md               语音分离模块说明
   ASR.md                      ASR 模块说明
@@ -108,8 +109,9 @@ scripts/
 
 ## 文档
 
-最终文档只保留五份：
+最终文档：
 
+- [新音频完整数据链路](docs/PIPELINE.md)
 - [语音增强](docs/ENHANCEMENT.md)
 - [语音分离](docs/SEPARATION.md)
 - [ASR 转写](docs/ASR.md)
