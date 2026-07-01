@@ -266,6 +266,101 @@ SEPARATION_RECURSIVE_MAX_STEPS=4
 
 递归扩展会选择复杂度较高的轨道继续拆分，直到达到目标轨道数或不再有可靠拆分。
 
+### 自动递归扩展才是分离过程里的“轨道数估计”
+
+如果没有配置 `expected_speakers`，代码不会先运行 `speaker_count_estimation_service` 来决定人数，而是进入自动递归扩展：
+
+```text
+基础分离结果
+-> 判断哪条轨道还像混合轨道
+-> 尝试把这条轨道再次分成 2 条
+-> 评估这次拆分是否可信
+-> 可信就接受，轨道数 +1
+-> 继续下一轮，直到没有可信拆分或达到上限
+```
+
+所以你汇报里如果说“系统自动估计应该分出几条轨道”，更准确指的是这一层：
+
+```text
+auto recursive blind expansion
+```
+
+它不是后面的 `speaker_count_estimation` 诊断，而是在分离过程中通过“能不能继续可信拆分”来自适应决定最终轨道数。
+
+默认上限来自：
+
+```text
+SEPARATION_AUTO_RECURSIVE_MAX_TRACKS
+SEPARATION_RECURSIVE_MAX_TRACKS=6
+SEPARATION_RECURSIVE_MAX_STEPS=4
+SEPARATION_AUTO_RECURSIVE_MAX_DEPTH
+```
+
+也就是说，自动扩展不会无限拆。它受到最大轨道数、最大递归步数和单条轨道最大递归深度限制。
+
+### 自动递归扩展如何判断“还要不要拆”
+
+自动递归扩展每一轮先选择一个父轨道。默认策略是：
+
+```text
+SEPARATION_RECURSIVE_PARENT_SELECTION=complexity
+```
+
+也就是优先挑复杂度最高的轨道。复杂度高通常表示这条轨道里可能还混着多个说话人。如果改成 `energy`，则优先挑 RMS 能量最高的轨道。
+
+选中父轨道后，系统会把父轨道再次送进当前分离模型，得到两个 child tracks。然后 `_score_recursive_split()` 判断这次拆分是否可信，核心指标有四个：
+
+```text
+energy_balance
+active_min
+parent_correlation
+child_correlation
+```
+
+含义：
+
+- `energy_balance`：两个子轨道能量是否均衡，计算为较小能量 / 较大能量。太低说明拆出来一条几乎没声音，像假拆分。
+- `active_min`：两个子轨道中较低的活跃比例。太低说明至少一条子轨道没有足够有效语音。
+- `parent_correlation`：两个子轨道相加后和父轨道的相关性。越高表示拆分后还能重建原父轨道。
+- `child_correlation`：两个子轨道之间的相关性。越高说明两条子轨道太像，可能没有真正分开。
+
+综合质量分：
+
+```text
+quality =
+  0.45 * energy_balance
+  + 0.30 * active_min
+  + 0.15 * parent_correlation
+  + 0.10 * (1 - child_correlation)
+```
+
+只有同时满足下面条件，这次拆分才会被接受：
+
+```text
+quality >= SEPARATION_AUTO_RECURSIVE_MIN_QUALITY
+energy_balance >= SEPARATION_AUTO_RECURSIVE_MIN_ENERGY_BALANCE
+active_min >= SEPARATION_AUTO_RECURSIVE_MIN_ACTIVE_RATIO
+child_correlation <= SEPARATION_AUTO_RECURSIVE_MAX_CHILD_CORRELATION
+```
+
+如果接受：
+
+```text
+父轨道 -> 两条子轨道
+总轨道数 +1
+继续下一轮
+```
+
+如果拒绝：
+
+```text
+保留当前轨道数
+尝试下一个候选父轨道
+如果没有任何可信拆分，就停止扩展
+```
+
+因此，当前输出 4 条轨道时，通常可以解释为：系统不是预先知道有 4 个说话人，而是在递归过程中连续找到了可信的可拆分轨道，接受了若干次拆分，最终得到 4 条分离轨道。
+
 ### 分块分离具体做什么
 
 当音频超过 `SEPARATION_MAX_SECONDS=60` 时，SpeechBrain 候选会分块执行。每个 chunk 都会输出一组轨道，但不同 chunk 的轨道顺序可能会交换，所以系统会提取轨道特征，计算 chunk 间相似度，把同一个说话人的轨道对齐到同一条长轨道，再拼接。
@@ -406,9 +501,9 @@ chunk_track_alignment_min_similarity
 
 选择父轨道时默认使用 `complexity` 策略，也就是优先选择频谱/能量变化更复杂、更像混合了多人声音的轨道。递归扩展不使用参考真值，也不读取 TextGrid。
 
-## 说话人数估计
+## 分离后的说话人数诊断
 
-说话人数估计由 `speaker_count_estimation_service` 在分离完成后执行。它是一个事后诊断模块，用来回答“当前分离轨道更像几个真实说话人”。它不会读取 TextGrid，也不会把估计结果反过来伪造分离轨道。
+这里的 `speaker_count_estimation_service` 不是上面那个“自动决定拆成几条轨道”的机制，而是在分离完成后执行的诊断模块。它用来回答“已经生成的这些轨道更像几个真实说话人”。它不会读取 TextGrid，也不会把估计结果反过来伪造分离轨道。
 
 默认开关：
 
@@ -421,12 +516,13 @@ SPEAKER_COUNT_MIN_TRACK_QUALITY=0.80
 SPEAKER_COUNT_MAX_TRACKS=64
 ```
 
-需要区分两件事：
+需要区分三件事：
 
 - `expected_speakers`：质量路由里的期望说话人数，来自 `SEPARATION_EXPECTED_SPEAKERS`、`SEPARATION_MIN_TRACKS` 或函数参数。
+- `auto recursive expansion`：没有明确期望人数时，通过“是否还能可信拆分轨道”来自适应增加轨道数。
 - `speaker_count_estimation`：分离结束后的轨道聚类诊断结果，默认不反向改变本次分离候选。
 
-### 说话人数估计总流程
+### 分离后诊断总流程
 
 ```text
 separated_tracks
@@ -640,13 +736,13 @@ signal_metrics["speaker_count_global_cluster_summary"]
 可以这样讲：
 
 ```text
-分离模型负责生成候选轨道；
-说话人数估计不直接相信轨道数，而是先过滤掉低质量轨道，
+自动递归扩展负责在分离过程中决定是否继续增加轨道；
+分离后的说话人数诊断不直接相信轨道数，而是先过滤掉低质量轨道，
 再用 ECAPA/CAM++ 说话人嵌入判断哪些轨道属于同一个人，
 最后通过聚类数量得到 estimated_speaker_count。
 ```
 
-这比“输出几条轨道就认为几个人”更稳，因为它会考虑轨道是否有效、是否串音、是否静音，以及不同轨道的声纹相似度。
+这两个机制解决的问题不同：自动递归扩展决定“分离时要不要继续拆”，分离后诊断判断“拆出来的轨道像不像真实说话人”。
 
 ## 后处理
 
