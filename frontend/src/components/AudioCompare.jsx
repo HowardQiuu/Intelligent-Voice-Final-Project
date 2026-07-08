@@ -7,7 +7,7 @@ export function AudioCompare({ result }) {
     <section className="panel audio-panel">
       <div className="panel-title">
         <FileAudio size={20} />
-        <h2>增强音频与中文会议转写</h2>
+        <h2>预处理音频与中文会议转写</h2>
       </div>
 
       <div className="audio-grid">
@@ -16,17 +16,12 @@ export function AudioCompare({ result }) {
           <audio controls src={apiUrl(result.original_audio_url)} />
         </div>
         <div className="audio-card enhanced">
-          <span>增强后音频</span>
+          <span>预处理后混合音频</span>
           <audio controls src={apiUrl(result.enhanced_audio_url)} />
         </div>
       </div>
 
-      {result.enhanced_asr_text && (
-        <div className="enhanced-asr-card">
-          <h3>增强后转写</h3>
-          <p>{result.enhanced_asr_text}</p>
-        </div>
-      )}
+      <TranscriptPreview title="合并转写预览" text={result.enhanced_asr_text} limit={260} />
 
       {result.separated_tracks?.length > 0 && (
         <div className="separation-list">
@@ -38,26 +33,42 @@ export function AudioCompare({ result }) {
                 <span>{track.label}</span>
                 <small>{track.description}</small>
                 <audio controls src={apiUrl(track.audio_url)} />
+                {track.track_enhancement_status && <small>增强: {track.track_enhancement_status}</small>}
+                {track.asr_status && <small>ASR: {track.asr_status}</small>}
+                <TranscriptPreview text={track.asr_text} limit={120} compact />
               </div>
             ))}
           </div>
-          <SeparationAlignment alignment={result.separation_alignment} transcript={result.transcript || []} />
-          <TextgridEvaluation evaluation={result.separation_evaluation} />
-        </div>
-      )}
-
-      {result.enhancement_visual_url && (
-        <div className="enhancement-visual">
-          <h3>语音增强可视化</h3>
-          <img
-            src={apiUrl(result.enhancement_visual_url)}
-            alt="语音增强前后波形、噪声底和清晰度对比图"
+          <TrackAlignmentOverview
+            alignment={result.separation_alignment}
+            transcript={result.transcript || []}
+            tracks={result.separated_tracks || []}
           />
+          <TextgridEvaluation evaluation={result.separation_evaluation} />
         </div>
       )}
 
       <ChunkPlan chunks={result.processing_chunks || []} />
     </section>
+  );
+}
+
+function TranscriptPreview({ title, text, limit = 220, compact = false }) {
+  const normalized = normalizeText(text);
+  if (!normalized) return null;
+  const clipped = normalized.length > limit;
+  const preview = clipped ? `${normalized.slice(0, limit)}...` : normalized;
+  return (
+    <div className={compact ? "track-transcript-preview" : "enhanced-asr-card"}>
+      {title && <h3>{title}</h3>}
+      <p>{preview}</p>
+      {clipped && (
+        <details>
+          <summary>展开全文</summary>
+          <p>{normalized}</p>
+        </details>
+      )}
+    </div>
   );
 }
 
@@ -114,30 +125,86 @@ function SpeakerCountDiagnostics({ estimation }) {
   );
 }
 
-function SeparationAlignment({ alignment, transcript }) {
-  if (!alignment || alignment.status !== "ok") return null;
-  const alignedSegments = (transcript || []).filter((segment) => segment.primary_track_id);
+function TrackAlignmentOverview({ alignment, transcript, tracks }) {
+  const alignmentInfo = alignment || {};
+  const summaries = summarizeTrackTranscript(transcript, tracks);
+  if (!summaries.length && alignmentInfo.status !== "ok") return null;
   return (
     <div className="alignment-panel">
-      <h3>ASR 分段与分离轨道对齐</h3>
+      <h3>轨道转写概览</h3>
       <div className="alignment-summary">
-        <span>已对齐分段：{alignment.aligned_segments || 0}</span>
-        <span>多轨重叠分段：{alignment.multi_track_segments || 0}</span>
-        <span>分离轨道数：{alignment.track_count || 0}</span>
+        <span>已对齐分段：{alignmentInfo.aligned_segments || 0}</span>
+        <span>已识别轨道：{summaries.length}</span>
+        <span>分离轨道数：{alignmentInfo.track_count || tracks.length || 0}</span>
       </div>
       <div className="alignment-grid">
-        {alignedSegments.slice(0, 6).map((segment, index) => (
-          <div className="alignment-row" key={`${segment.start}-${segment.end}-${index}`}>
-            <strong>
-              {segment.start}-{segment.end}
-            </strong>
-            <span>{segment.primary_track_label || segment.primary_track_id}</span>
-            <small>{segment.text || "无文本"}</small>
+        {summaries.map((item) => (
+          <div className="alignment-row" key={item.track_id}>
+            <strong>{formatTrackTime(item.start, item.end)}</strong>
+            <span>{item.label}</span>
+            <small>{item.segmentCount} 个转写段</small>
+            <p>{previewText(item.text, 90) || "暂无有效转写"}</p>
           </div>
         ))}
       </div>
     </div>
   );
+}
+
+function summarizeTrackTranscript(transcript, tracks) {
+  const labels = new Map((tracks || []).map((track) => [track.track_id, track.label || track.track_id]));
+  const grouped = new Map();
+  for (const segment of transcript || []) {
+    const trackId = segment.primary_track_id || (segment.separation_tracks || [])[0];
+    if (!trackId) continue;
+    const current = grouped.get(trackId) || {
+      track_id: trackId,
+      label: segment.primary_track_label || labels.get(trackId) || trackId,
+      start: segment.start,
+      end: segment.end,
+      segmentCount: 0,
+      texts: [],
+    };
+    current.segmentCount += 1;
+    current.start = earliestTime(current.start, segment.start);
+    current.end = latestTime(current.end, segment.end);
+    if (segment.text) current.texts.push(segment.text);
+    grouped.set(trackId, current);
+  }
+  return Array.from(grouped.values()).map((item) => ({
+    ...item,
+    text: normalizeText(item.texts.join(" ")),
+  }));
+}
+
+function normalizeText(value) {
+  return String(value || "").replace(/\s+/g, " ").trim();
+}
+
+function previewText(value, limit) {
+  const normalized = normalizeText(value);
+  if (normalized.length <= limit) return normalized;
+  return `${normalized.slice(0, limit)}...`;
+}
+
+function earliestTime(first, second) {
+  return timeSeconds(second) < timeSeconds(first) ? second : first;
+}
+
+function latestTime(first, second) {
+  return timeSeconds(second) > timeSeconds(first) ? second : first;
+}
+
+function timeSeconds(value) {
+  const parts = String(value || "0").split(":").map(Number);
+  if (parts.some(Number.isNaN)) return 0;
+  if (parts.length === 3) return parts[0] * 3600 + parts[1] * 60 + parts[2];
+  if (parts.length === 2) return parts[0] * 60 + parts[1];
+  return Number(value || 0);
+}
+
+function formatTrackTime(start, end) {
+  return `${start || "00:00"}-${end || "00:00"}`;
 }
 
 function TextgridEvaluation({ evaluation }) {

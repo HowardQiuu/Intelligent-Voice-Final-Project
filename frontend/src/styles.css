@@ -547,6 +547,23 @@ button:disabled {
   line-height: 1.5;
 }
 
+.track-transcript-preview {
+  margin-top: 8px;
+}
+
+.track-transcript-preview p,
+.track-transcript-preview details p {
+  margin: 0;
+  color: var(--ink);
+  font-size: 13px;
+  line-height: 1.65;
+  overflow-wrap: anywhere;
+}
+
+.track-transcript-preview details {
+  margin-top: 6px;
+}
+
 .separation-list {
   margin-top: 2px;
 }
@@ -569,7 +586,6 @@ button:disabled {
 
 .separation-list h3,
 .alignment-panel h3,
-.enhancement-visual h3,
 .chunk-list h3,
 .asr-compare h3,
 .summary-grid h3,
@@ -664,6 +680,13 @@ button:disabled {
   color: var(--ink-soft);
 }
 
+.alignment-row p {
+  margin: 8px 0 0;
+  color: var(--ink);
+  font-size: 13px;
+  line-height: 1.55;
+}
+
 .enhanced-asr-card {
   padding: 16px;
   border-left: 5px solid var(--teal);
@@ -683,17 +706,15 @@ button:disabled {
   overflow-wrap: anywhere;
 }
 
-.enhancement-visual {
-  padding: 16px;
+.enhanced-asr-card details {
+  margin-top: 8px;
 }
 
-.enhancement-visual img {
-  display: block;
-  width: 100%;
-  height: auto;
-  background: white;
-  border: 1px solid var(--line);
-  border-radius: 8px;
+.enhanced-asr-card summary,
+.track-transcript-preview summary {
+  cursor: pointer;
+  color: var(--teal-dark);
+  font-weight: 800;
 }
 
 .chunk-list {

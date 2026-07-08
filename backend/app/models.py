@@ -38,6 +38,12 @@ class SeparatedTrack(BaseModel):
     label: str
     audio_url: str
     description: str
+    separated_audio_url: str = ""
+    track_enhancement_status: str = ""
+    track_enhancement_method: str = ""
+    asr_text: str = ""
+    asr_status: str = ""
+    transcript: list[TranscriptSegment] = Field(default_factory=list)
 
 
 class ProcessingChunk(BaseModel):
@@ -91,4 +97,4 @@ class UploadSessionResponse(BaseModel):
 class UploadSessionCompleteRequest(BaseModel):
     filename: str
     total_chunks: int = Field(ge=1)
-    processing_mode: str = "fast"
+    processing_mode: str = "full"

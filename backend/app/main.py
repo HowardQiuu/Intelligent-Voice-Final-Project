@@ -63,7 +63,7 @@ def demo_cases() -> list[dict]:
 
 
 @app.post("/api/process-demo/{case_id}", response_model=ProcessResult)
-def process_demo(case_id: str, processing_mode: str = "fast") -> ProcessResult:
+def process_demo(case_id: str, processing_mode: str = "full") -> ProcessResult:
     try:
         return process_demo_case(case_id, processing_mode=processing_mode)
     except KeyError as exc:
@@ -87,7 +87,7 @@ def separate_demo(case_id: str) -> dict:
 
 
 @app.post("/api/upload", response_model=ProcessResult)
-async def upload_audio(file: UploadFile = File(...), processing_mode: str = "fast") -> ProcessResult:
+async def upload_audio(file: UploadFile = File(...), processing_mode: str = "full") -> ProcessResult:
     suffix = _validate_audio_suffix(file.filename or "meeting.wav")
     UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
     raw_path = UPLOAD_DIR / f"{uuid.uuid4().hex}{suffix}"

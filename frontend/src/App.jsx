@@ -18,7 +18,7 @@ export function App() {
   const [result, setResult] = useState(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
-  const [processingMode, setProcessingMode] = useState("fast");
+  const [processingMode, setProcessingMode] = useState("full");
   const [uploadProgress, setUploadProgress] = useState(null);
   const uploadRef = useRef(null);
 

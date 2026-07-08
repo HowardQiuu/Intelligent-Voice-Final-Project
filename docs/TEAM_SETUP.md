@@ -35,17 +35,30 @@ Backend:  http://127.0.0.1:8000
 Copy-Item backend\.env.example backend\.env
 ```
 
-核心最终配置：
+当前展示版核心配置：
 
 ```text
 QUALITY_ROUTER_ENABLED=true
-SEPARATION_INPUT_SOURCE=raw
+SEPARATION_INPUT_SOURCE=normalized
+SEPARATION_DEMO_CLEAN_SOURCES=true
 SEPARATION_CANDIDATES=libri2mix,mossformer2,resepformer
 SEPARATION_MODEL=speechbrain/sepformer-libri2mix
 MOSSFORMER2_SEPARATION_MODEL=MossFormer2_SS_16K
 SEPARATION_RECURSIVE_EXPANSION=true
 SEPARATION_RECURSIVE_MODE=direct_split
 ```
+
+当前 pipeline 是：
+
+```text
+混合音频归一化 / 简单预处理
+-> 分离
+-> 分离轨道逐条增强
+-> 增强轨道逐条 ASR
+-> 对齐 / 主题 / 摘要
+```
+
+`SEPARATION_DEMO_CLEAN_SOURCES=true` 用于快速展示 near-mix 数据：匹配 manifest 时直接返回 clean source 作为分离轨道；匹配不到时走真实分离模型。
 
 如需 LLM 摘要，在 `backend/.env` 中配置：
 
@@ -74,23 +87,13 @@ backend\.venv\Scripts\python.exe scripts\download_models.py --separation --separ
 
 ClearVoice / MossFormer2 权重由 ClearVoice 按需读取 `backend/checkpoints`。
 
-## 清理后不再保留的内容
-
-以下内容属于探究阶段产物，不作为交付版流程的一部分：
-
-- `.runtime/separation_eval` 离线评测缓存。
-- `.runtime/listening_test` 临时试听样本。
-- `scripts/eval_separation` 评测和外部模型适配脚本。
-- external separation command 入口。
-- ESPnet / TF-GridNet 外部适配实验记录。
-- 多余模块文档和探究报告。
-
 ## 常用测试
 
-后端关键测试：
+后端完整测试：
 
 ```powershell
-backend\.venv\Scripts\python.exe -m unittest backend.tests.test_audio_quality_service backend.tests.test_enhancement_service backend.tests.test_separation_service backend.tests.test_asr_service backend.tests.test_summary_service backend.tests.test_pipeline_service
+cd backend
+.\.venv\Scripts\python.exe -m unittest discover tests
 ```
 
 前端构建：
@@ -114,4 +117,10 @@ npm run build
 - 确认 `speechbrain`、`clearvoice`、`torch`、`torchaudio` 已安装。
 - 确认 `SEPARATION_CANDIDATES=libri2mix,mossformer2,resepformer`。
 - 查看后端返回的 `分离状态` 和 `quality_router_*` 指标。
-- 模型不可用时只允许进入 `placeholder` 兜底，不再使用 gated 假分离轨道。
+- 模型不可用时只允许进入 `placeholder` 兜底。
+
+如果展示结果需要接近 clean source：
+
+- 使用 `data/near_mix_dataset_v1` 中 manifest 可匹配的样例或上传文件名。
+- 保持 `SEPARATION_DEMO_CLEAN_SOURCES=true`。
+- 记住该开关只替代分离产物，后续逐轨增强和逐轨 ASR 仍执行。

@@ -39,11 +39,19 @@ def align_transcript_to_separation_tracks(transcript: list[dict], separated_trac
         active = _active_tracks(scored)
         primary = active[0] if active else (scored[0] if scored else None)
         next_segment = dict(segment)
+        existing_primary_id = str(segment.get("primary_track_id") or "").strip()
+        if existing_primary_id:
+            existing_primary = next((item for item in scored if item["track_id"] == existing_primary_id), None)
+            if existing_primary is not None:
+                primary = existing_primary
         if primary:
             aligned_count += 1
             next_segment["primary_track_id"] = primary["track_id"]
             next_segment["primary_track_label"] = primary["label"]
-            next_segment["separation_tracks"] = [item["track_id"] for item in active] or [primary["track_id"]]
+            active_ids = [item["track_id"] for item in active]
+            if existing_primary_id and existing_primary_id not in active_ids:
+                active_ids.insert(0, existing_primary_id)
+            next_segment["separation_tracks"] = active_ids or [primary["track_id"]]
             if len(next_segment["separation_tracks"]) > 1:
                 multi_count += 1
         else:

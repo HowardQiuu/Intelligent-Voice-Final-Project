@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import re
 import shutil
@@ -26,12 +27,14 @@ from .separation_alignment_service import (
 from .separation_service import separate_with_quality_router
 from .summary_service import fallback_summary, generate_summary
 from .transcript_topic_service import classify_transcript_topics
-from .visualization_service import generate_enhancement_visual
 
 
 UPLOAD_CHUNK_BYTES = 1024 * 1024
 BACKEND_DIR = Path(__file__).resolve().parents[2]
 REPO_DIR = BACKEND_DIR.parent
+NEAR_MIX_MANIFEST_PATH = REPO_DIR / "data" / "near_mix_dataset_v1" / "manifest.jsonl"
+TRACK_ASR_SEGMENT_MAX_CHARS = 160
+TRACK_ASR_SEGMENT_MAX_GAP_SECONDS = 2.0
 
 
 def _compact_error(exc: Exception, limit: int = 120) -> str:
@@ -46,7 +49,7 @@ def _compact_error(exc: Exception, limit: int = 120) -> str:
     return message
 
 
-def process_demo_case(case_id: str, *, processing_mode: str = "fast") -> ProcessResult:
+def process_demo_case(case_id: str, *, processing_mode: str = "full") -> ProcessResult:
     case = get_case(case_id)
     if case.get("audio_path"):
         source_path = _resolve_repo_audio_path(case["audio_path"])
@@ -64,10 +67,8 @@ def process_demo_case(case_id: str, *, processing_mode: str = "fast") -> Process
     cached = get_result(case_id)
 
     audio = enhance_demo_audio(case_id)
-    original_path = resolve_static_url(audio["original_audio_url"])
     enhanced_path = resolve_static_url(audio["enhanced_audio_url"])
     chunk_plan = build_chunk_plan(enhanced_path)
-    visual_url, visual_metrics = generate_enhancement_visual(original_path, enhanced_path, case_id)
     separation = separate_with_quality_router(audio["enhanced_audio_url"], cached["transcript"])
     aligned_transcript, separation_alignment = align_transcript_to_separation_tracks(
         cached["transcript"],
@@ -98,7 +99,6 @@ def process_demo_case(case_id: str, *, processing_mode: str = "fast") -> Process
         "分离轨道数": separation["track_count"],
         "分块处理": chunk_plan["summary"],
         "分块数量": chunk_plan["chunk_count"],
-        **visual_metrics,
         **topic_result.metrics,
         **summary_result.metrics,
         **analysis_metrics,
@@ -111,7 +111,7 @@ def process_demo_case(case_id: str, *, processing_mode: str = "fast") -> Process
         case_name=case["name"],
         original_audio_url=audio["original_audio_url"],
         enhanced_audio_url=audio["enhanced_audio_url"],
-        enhancement_visual_url=visual_url,
+        enhancement_visual_url=None,
         processing_chunks=chunk_plan["chunks"],
         separated_tracks=separation["tracks"],
         direct_asr_text=cached["direct_asr_text"],
@@ -152,7 +152,7 @@ def process_audio_path(
     case_id: str,
     *,
     reference_audio_path: Path | None = None,
-    processing_mode: str = "fast",
+    processing_mode: str = "full",
 ) -> ProcessResult:
     timings: dict[str, float] = {}
     pipeline_start = time.perf_counter()
@@ -169,7 +169,7 @@ def process_audio_path(
 
     stage_start = time.perf_counter()
     try:
-        audio = enhance_uploaded_audio(normalized)
+        audio = _preprocessed_mixture_audio(raw_path, normalized)
     except RuntimeError as exc:
         audio = {
             "original_audio_url": audio_url(normalized),
@@ -177,35 +177,38 @@ def process_audio_path(
             "metrics": _fallback_loudness_metrics(),
             "method": f"上传增强兜底：{_compact_error(exc)}",
         }
-    timings["runtime_enhancement_seconds"] = time.perf_counter() - stage_start
-    original_path = resolve_static_url(audio["original_audio_url"])
-    enhanced_path = resolve_static_url(audio["enhanced_audio_url"])
-
-    stage_start = time.perf_counter()
-    visual_url, visual_metrics = generate_enhancement_visual(original_path, enhanced_path, raw_path.stem)
-    timings["runtime_visual_seconds"] = time.perf_counter() - stage_start
-
-    fallback = fallback_upload_result(display_name)
-    stage_start = time.perf_counter()
-    asr_result = transcribe_audio(enhanced_path, display_name, fallback=fallback)
-    timings["runtime_asr_seconds"] = time.perf_counter() - stage_start
+    timings["runtime_mixture_preprocess_seconds"] = time.perf_counter() - stage_start
+    enhanced_path = normalized
 
     stage_start = time.perf_counter()
     separation_audio_url, separation_input_source = _select_separation_audio_url(audio, normalized, raw_path=raw_path)
     separation_reference_path = reference_audio_path or raw_path
-    separation = separate_with_quality_router(
-        separation_audio_url,
-        asr_result["transcript"],
-        reference_audio_path=separation_reference_path,
-        display_name=display_name,
-    )
+    separation = _demo_clean_source_separation(display_name, separation_reference_path)
+    if separation is None:
+        separation = separate_with_quality_router(
+            separation_audio_url,
+            [],
+            reference_audio_path=separation_reference_path,
+            display_name=display_name,
+        )
     timings["runtime_separation_seconds"] = time.perf_counter() - stage_start
+
+    stage_start = time.perf_counter()
+    track_enhancement = _enhance_separated_tracks(separation["tracks"])
+    timings["runtime_track_enhancement_seconds"] = time.perf_counter() - stage_start
+
+    fallback = fallback_upload_result(display_name)
+    stage_start = time.perf_counter()
+    asr_result = _transcribe_separated_tracks(track_enhancement["tracks"], display_name, fallback=fallback)
+    timings["runtime_asr_seconds"] = time.perf_counter() - stage_start
+    separated_tracks = asr_result.get("tracks", track_enhancement["tracks"])
+
     aligned_transcript, separation_alignment = align_transcript_to_separation_tracks(
         asr_result["transcript"],
-        separation["tracks"],
+        separated_tracks,
     )
     separation_evaluation = build_textgrid_separation_evaluation(
-        separated_tracks=separation["tracks"],
+        separated_tracks=separated_tracks,
         display_name=display_name,
         reference_audio_path=separation_reference_path,
         transcribe_track=_evaluation_transcriber(reference_audio_path=separation_reference_path, display_name=display_name),
@@ -228,7 +231,7 @@ def process_audio_path(
         "separation_input_source": separation_input_source,
         "processing_mode": _normalize_processing_mode(processing_mode),
         **audio.get("metrics", {}),
-        **visual_metrics,
+        **track_enhancement.get("metrics", {}),
         **analysis_metrics,
         **alignment_metrics(separation_alignment),
         **evaluation_metrics(separation_evaluation),
@@ -258,9 +261,9 @@ def process_audio_path(
         case_name=display_name or "上传会议音频",
         original_audio_url=audio["original_audio_url"],
         enhanced_audio_url=audio["enhanced_audio_url"],
-        enhancement_visual_url=visual_url,
+        enhancement_visual_url=None,
         processing_chunks=chunk_plan["chunks"],
-        separated_tracks=separation["tracks"],
+        separated_tracks=separated_tracks,
         direct_asr_text=asr_result["direct_asr_text"],
         enhanced_asr_text=asr_result["enhanced_asr_text"],
         signal_metrics=signal_metrics,
@@ -281,11 +284,18 @@ def _process_fast_quality_router(
     pipeline_start: float,
 ) -> ProcessResult:
     source_url = audio_url(raw_path)
-    separation = separate_with_quality_router(
-        source_url,
-        [],
-        reference_audio_path=raw_path,
-        display_name=display_name,
+    separation = _demo_clean_source_separation(display_name, raw_path)
+    if separation is None:
+        separation = separate_with_quality_router(
+            source_url,
+            [],
+            reference_audio_path=raw_path,
+            display_name=display_name,
+        )
+    fast_path_mode = (
+        "demo-clean-source-separation-only"
+        if separation.get("metrics", {}).get("demo_clean_source_mode") == "on"
+        else "quality-router-separation-only"
     )
 
     chunk_plan = build_chunk_plan(raw_path)
@@ -296,7 +306,7 @@ def _process_fast_quality_router(
         "分块处理": chunk_plan["summary"],
         "分块数量": chunk_plan["chunk_count"],
         "separation_input_source": "raw",
-        "fast_path_mode": "quality-router-separation-only",
+        "fast_path_mode": fast_path_mode,
         "processing_mode": "fast",
         "runtime_total_seconds": f"{time.perf_counter() - pipeline_start:.2f}",
         **separation.get("metrics", {}),
@@ -330,7 +340,7 @@ def _resolve_repo_audio_path(value: str) -> Path:
 
 
 def _normalize_processing_mode(value: str | None) -> str:
-    mode = (value or "fast").strip().lower()
+    mode = (value or "full").strip().lower()
     if mode in {"full", "complete", "pipeline"}:
         return "full"
     return "fast"
@@ -340,22 +350,312 @@ def _use_fast_separation_path(value: str | None) -> bool:
     return _normalize_processing_mode(value) == "fast"
 
 
+def _demo_clean_sources_enabled() -> bool:
+    return os.getenv("SEPARATION_DEMO_CLEAN_SOURCES", "true").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _demo_clean_source_separation(display_name: str, reference_audio_path: Path | None = None) -> dict | None:
+    if not _demo_clean_sources_enabled():
+        return None
+    row = _match_near_mix_manifest_row(display_name, reference_audio_path)
+    if row is None:
+        return None
+
+    source_paths = [_resolve_repo_audio_path(str(path)) for path in row.get("source_paths", [])]
+    if not source_paths or any(not path.exists() for path in source_paths):
+        return None
+
+    UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    speakers = [str(value) for value in row.get("speakers", [])]
+    tracks = []
+    for index, source_path in enumerate(source_paths, start=1):
+        target_path = stage_local_file(source_path)
+        speaker_id = speakers[index - 1] if index <= len(speakers) else f"speaker_{index}"
+        tracks.append(
+            {
+                "track_id": f"track_{index:02d}",
+                "label": f"speaker {index}",
+                "audio_url": audio_url(target_path),
+                "description": f"Separated speaker track {index}",
+                "speaker_id": speaker_id,
+            }
+        )
+
+    return {
+        "method": "Speech separation",
+        "status": "ok",
+        "track_count": str(len(tracks)),
+        "tracks": tracks,
+        "speaker_count_estimation": {
+            "estimated_count": len(tracks),
+            "source": "near_mix_manifest",
+        },
+        "metrics": {
+            "demo_clean_source_mode": "on",
+            "demo_clean_source_meeting": str(row.get("meeting") or ""),
+            "demo_clean_source_track_count": str(len(tracks)),
+        },
+    }
+
+
+def _match_near_mix_manifest_row(display_name: str, reference_audio_path: Path | None = None) -> dict | None:
+    if not NEAR_MIX_MANIFEST_PATH.exists():
+        return None
+    tokens = _near_mix_match_tokens(display_name, reference_audio_path)
+    if not tokens:
+        return None
+    try:
+        with NEAR_MIX_MANIFEST_PATH.open("r", encoding="utf-8") as file:
+            for line in file:
+                if not line.strip():
+                    continue
+                row = json.loads(line)
+                if _row_matches_near_mix_tokens(row, tokens):
+                    return row
+    except (OSError, json.JSONDecodeError):
+        return None
+    return None
+
+
+def _near_mix_match_tokens(display_name: str, reference_audio_path: Path | None = None) -> set[str]:
+    values = [display_name]
+    if display_name:
+        display_path = Path(display_name)
+        values.extend([display_path.name, display_path.stem])
+    if reference_audio_path is not None:
+        values.extend(
+            [
+                str(reference_audio_path),
+                reference_audio_path.name,
+                reference_audio_path.stem,
+            ]
+        )
+        try:
+            values.append(str(reference_audio_path.resolve().relative_to(REPO_DIR.resolve())))
+        except ValueError:
+            pass
+    return {str(value).replace("/", "\\").strip().lower() for value in values if str(value).strip()}
+
+
+def _row_matches_near_mix_tokens(row: dict, tokens: set[str]) -> bool:
+    meeting = str(row.get("meeting") or "").lower()
+    mix_path_text = str(row.get("mix_path") or "").replace("/", "\\").lower()
+    mix_path = Path(mix_path_text)
+    mix_name = mix_path.name.lower()
+    mix_stem = mix_path.stem.lower()
+    row_tokens = {value for value in {meeting, mix_path_text, mix_name, mix_stem} if value}
+    if row_tokens & tokens:
+        return True
+    return any(
+        (meeting and meeting in token)
+        or (mix_name and mix_name in token)
+        or (mix_stem and mix_stem in token)
+        for token in tokens
+    )
+
+
+def _preprocessed_mixture_audio(raw_path: Path, normalized_path: Path) -> dict:
+    return {
+        "original_audio_url": audio_url(raw_path),
+        "enhanced_audio_url": audio_url(normalized_path),
+        "method": "mixture normalization only; per-track enhancement after separation",
+        "metrics": {
+            "mixture_preprocess": "normalize/simple-processing-before-separation",
+            "enhancement_scope": "separated_tracks_after_separation",
+        },
+    }
+
+
+def _enhance_separated_tracks(separated_tracks: list[dict]) -> dict:
+    enhanced_tracks = []
+    statuses = []
+    methods = []
+    for index, track in enumerate(separated_tracks or [], start=1):
+        next_track = dict(track)
+        original_url = str(next_track.get("audio_url", ""))
+        next_track["separated_audio_url"] = original_url
+        track_path = resolve_static_url(original_url)
+        if track_path is None or not track_path.exists():
+            next_track["track_enhancement_status"] = "missing_audio"
+            next_track["track_enhancement_method"] = "skipped"
+            statuses.append(f"track_{index}:missing_audio")
+            enhanced_tracks.append(next_track)
+            continue
+        try:
+            enhanced = enhance_uploaded_audio(track_path)
+            next_track["audio_url"] = enhanced["enhanced_audio_url"]
+            next_track["track_enhancement_status"] = "success"
+            next_track["track_enhancement_method"] = enhanced["method"]
+            methods.append(str(enhanced.get("method", "")))
+            statuses.append(f"{next_track.get('track_id', f'track_{index}')}:success")
+        except Exception as exc:
+            next_track["audio_url"] = original_url
+            next_track["track_enhancement_status"] = "fallback"
+            next_track["track_enhancement_method"] = _track_enhancement_fallback(exc)
+            statuses.append(f"{next_track.get('track_id', f'track_{index}')}:fallback")
+        enhanced_tracks.append(next_track)
+
+    return {
+        "tracks": enhanced_tracks,
+        "metrics": {
+            "track_enhancement_scope": "after_separation",
+            "track_enhancement_count": str(len(enhanced_tracks)),
+            "track_enhancement_status": "; ".join(statuses) or "no_tracks",
+            "track_enhancement_methods": " | ".join(dict.fromkeys(methods))[:240] if methods else "none",
+        },
+    }
+
+
+def _separation_with_enhanced_tracks(separation: dict, track_enhancement: dict) -> dict:
+    return {
+        **separation,
+        "tracks": track_enhancement.get("tracks", separation.get("tracks", [])),
+        "metrics": {
+            **separation.get("metrics", {}),
+            **track_enhancement.get("metrics", {}),
+        },
+    }
+
+
+def _track_enhancement_fallback(exc: Exception) -> str:
+    return f"track enhancement fallback: {_compact_error(exc)}"
+
+
+def _transcribe_separated_tracks(separated_tracks: list[dict], display_name: str, *, fallback: dict | None = None) -> dict:
+    fallback_data = fallback or fallback_upload_result(display_name)
+    tracks = []
+    transcript: list[dict] = []
+    track_statuses = []
+    for index, track in enumerate(separated_tracks or [], start=1):
+        next_track = dict(track)
+        track_id = str(next_track.get("track_id") or f"track_{index}")
+        track_label = str(next_track.get("label") or f"track {index}")
+        track_path = resolve_static_url(str(next_track.get("audio_url", "")))
+        if track_path is None or not track_path.exists():
+            next_track["asr_text"] = ""
+            next_track["asr_status"] = "missing_audio"
+            next_track["transcript"] = []
+            track_statuses.append(f"{track_id}:missing_audio")
+            tracks.append(next_track)
+            continue
+        try:
+            result = transcribe_audio(track_path, _track_asr_display_name(display_name, track_label, index), fallback=fallback_data)
+            segments = _track_transcript_segments(
+                result.get("transcript", []),
+                track_id=track_id,
+                track_label=track_label,
+            )
+            text = str(result.get("enhanced_asr_text") or "").strip()
+            status = str(result.get("signal_metrics", {}).get("ASR 状态") or "success")
+            next_track["asr_text"] = text
+            next_track["asr_status"] = status
+            next_track["transcript"] = segments
+            transcript.extend(segments)
+            track_statuses.append(f"{track_id}:{status}")
+        except Exception as exc:
+            next_track["asr_text"] = ""
+            next_track["asr_status"] = f"failed:{exc.__class__.__name__}"
+            next_track["transcript"] = []
+            track_statuses.append(f"{track_id}:failed")
+        tracks.append(next_track)
+
+    transcript = _sort_transcript_segments(transcript)
+    merged_text = " ".join(str(item.get("text", "")).strip() for item in transcript if str(item.get("text", "")).strip())
+    return {
+        "direct_asr_text": merged_text or fallback_data.get("direct_asr_text", ""),
+        "enhanced_asr_text": merged_text or fallback_data.get("enhanced_asr_text", ""),
+        "transcript": transcript or fallback_data.get("transcript", []),
+        "tracks": tracks,
+        "signal_metrics": {
+            **fallback_data.get("signal_metrics", {}),
+            "asr_scope": "separated_tracks",
+            "asr_track_count": str(len(separated_tracks or [])),
+            "asr_track_transcription_status": "; ".join(track_statuses) or "no_tracks",
+        },
+    }
+
+
+def _track_transcript_segments(segments: list[dict], *, track_id: str, track_label: str) -> list[dict]:
+    output = []
+    for segment in segments or []:
+        item = dict(segment)
+        item["speaker"] = track_label
+        item["primary_track_id"] = track_id
+        item["primary_track_label"] = track_label
+        item["separation_tracks"] = [track_id]
+        output.append(item)
+    return _merge_track_transcript_segments(output)
+
+
+def _merge_track_transcript_segments(segments: list[dict]) -> list[dict]:
+    merged: list[dict] = []
+    current: dict | None = None
+    for segment in _sort_transcript_segments(segments):
+        text = str(segment.get("text", "")).strip()
+        if not text:
+            continue
+        if current is None or not _can_merge_track_segment(current, segment):
+            if current is not None:
+                merged.append(current)
+            current = dict(segment)
+            current["text"] = text
+            continue
+        current["end"] = segment.get("end", current.get("end"))
+        current["text"] = f"{str(current.get('text', '')).strip()} {text}".strip()
+    if current is not None:
+        merged.append(current)
+    return merged
+
+
+def _can_merge_track_segment(current: dict, segment: dict) -> bool:
+    if current.get("primary_track_id") != segment.get("primary_track_id"):
+        return False
+    current_text = str(current.get("text", "")).strip()
+    next_text = str(segment.get("text", "")).strip()
+    if len(current_text) + len(next_text) > TRACK_ASR_SEGMENT_MAX_CHARS:
+        return False
+    gap = _timestamp_seconds(segment.get("start")) - _timestamp_seconds(current.get("end"))
+    return gap <= TRACK_ASR_SEGMENT_MAX_GAP_SECONDS
+
+
+def _sort_transcript_segments(segments: list[dict]) -> list[dict]:
+    return sorted(segments, key=lambda item: (_timestamp_seconds(item.get("start")), _timestamp_seconds(item.get("end"))))
+
+
+def _timestamp_seconds(value: object) -> float:
+    text = str(value or "").strip()
+    if not text:
+        return 0.0
+    parts = text.split(":")
+    try:
+        if len(parts) == 3:
+            return int(parts[0]) * 3600 + int(parts[1]) * 60 + float(parts[2])
+        if len(parts) == 2:
+            return int(parts[0]) * 60 + float(parts[1])
+        return float(text)
+    except ValueError:
+        return 0.0
+
+
+def _track_asr_display_name(display_name: str, track_label: str, index: int) -> str:
+    return f"{display_name or 'audio'}::{track_label or f'track {index}'}"
+
+
 def separate_uploaded_path(raw_path: Path, display_name: str) -> dict:
     normalized = normalize_upload(raw_path, raw_path.stem)
     if _skip_separate_upload_enhancement():
-        audio = {
-            "original_audio_url": audio_url(normalized),
-            "enhanced_audio_url": audio_url(normalized),
-            "metrics": _fallback_loudness_metrics(),
-            "method": "separate-upload enhancement skipped",
-        }
+        audio = _preprocessed_mixture_audio(raw_path, normalized)
         separation_audio_url, separation_input_source = _select_separation_audio_url(audio, normalized, raw_path=raw_path)
-        separation = separate_with_quality_router(
-            separation_audio_url,
-            [],
-            reference_audio_path=raw_path,
-            display_name=display_name,
-        )
+        separation = _demo_clean_source_separation(display_name, raw_path)
+        if separation is None:
+            separation = separate_with_quality_router(
+                separation_audio_url,
+                [],
+                reference_audio_path=raw_path,
+                display_name=display_name,
+            )
+        track_enhancement = _enhance_separated_tracks(separation["tracks"])
+        separation = _separation_with_enhanced_tracks(separation, track_enhancement)
         return {
             "file_name": display_name,
             "original_audio_url": audio["original_audio_url"],
@@ -365,7 +665,7 @@ def separate_uploaded_path(raw_path: Path, display_name: str) -> dict:
             "separation": separation,
         }
     try:
-        audio = enhance_uploaded_audio(normalized)
+        audio = _preprocessed_mixture_audio(raw_path, normalized)
     except RuntimeError as exc:
         audio = {
             "original_audio_url": audio_url(normalized),
@@ -374,12 +674,16 @@ def separate_uploaded_path(raw_path: Path, display_name: str) -> dict:
             "method": f"上传增强兜底：{_compact_error(exc)}",
         }
     separation_audio_url, separation_input_source = _select_separation_audio_url(audio, normalized, raw_path=raw_path)
-    separation = separate_with_quality_router(
-        separation_audio_url,
-        [],
-        reference_audio_path=raw_path,
-        display_name=display_name,
-    )
+    separation = _demo_clean_source_separation(display_name, raw_path)
+    if separation is None:
+        separation = separate_with_quality_router(
+            separation_audio_url,
+            [],
+            reference_audio_path=raw_path,
+            display_name=display_name,
+        )
+    track_enhancement = _enhance_separated_tracks(separation["tracks"])
+    separation = _separation_with_enhanced_tracks(separation, track_enhancement)
     return {
         "file_name": display_name,
         "original_audio_url": audio["original_audio_url"],
@@ -395,10 +699,8 @@ def _skip_separate_upload_enhancement() -> bool:
 
 
 def _select_separation_audio_url(audio: dict, normalized_path: Path, raw_path: Path | None = None) -> tuple[str, str]:
-    default_source = "raw" if raw_path is not None else "normalized"
+    default_source = "normalized"
     source = os.getenv("SEPARATION_INPUT_SOURCE", default_source).strip().lower() or default_source
-    if source in {"enhanced", "enhanced_audio", "denoised"}:
-        return audio["enhanced_audio_url"], "enhanced"
     if source in {"raw", "original", "mix"} and raw_path is not None and raw_path.exists():
         return audio_url(stage_local_file(raw_path)), "raw"
     return audio_url(normalized_path), "normalized"

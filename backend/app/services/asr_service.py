@@ -31,10 +31,13 @@ def build_pipeline_steps(cache_mode: bool = True) -> list[dict]:
     source = "缓存结果" if cache_mode else "上传音频"
     return [
         {"key": "input", "name": "会议音频输入", "status": "done", "detail": f"已读取{source}"},
-        {"key": "enhance", "name": "语音增强", "status": "done", "detail": "完成降噪、归一化与增强音频输出"},
+        {"key": "enhance", "name": "输入预处理", "status": "done", "detail": "完成混合音频归一化与简单预处理"},
         {"key": "chunking", "name": "分块处理", "status": "done", "detail": "按固定窗口规划长会议音频，避免一次性占满内存"},
         {"key": "separation", "name": "语音分离", "status": "done", "detail": "输出可替换的说话人语音轨道结果"},
-        {"key": "asr", "name": "自动语音识别", "status": "done", "detail": "基于增强音频生成带时间戳的会议转写文本"},
+        {"key": "track_enhance", "name": "轨道增强", "status": "done", "detail": "对每条分离轨道单独降噪和音量处理"},
+        {"key": "asr", "name": "自动语音识别", "status": "done", "detail": "对分离轨道逐轨转写，并合并带时间戳的会议文本"},
+        {"key": "alignment", "name": "时间戳对齐", "status": "done", "detail": "把每条转写片段对齐到对应分离轨道"},
+        {"key": "topics", "name": "主题提取", "status": "done", "detail": "按会议内容聚合主题、关键词与阶段摘要"},
         {"key": "summary", "name": "概要生成", "status": "done", "detail": "提取主题、关键词、决策与待办事项"},
     ]
 
